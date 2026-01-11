@@ -64,5 +64,3 @@ Additional MIR tasks can be added as new subdirectories following the same struc
 - **MuseTok**: [Yuer867/MuseTok](https://github.com/Yuer867/MuseTok) - Symbolic Music Tokenization for Generation and Semantic Understanding
 - **jingyue_latents**: [pnlong/jingyue_latents](https://github.com/pnlong/jingyue_latents) - MIR Tasks for Jingyue's Tokenization Project
 - **GigaMIDI**: [Metacreation/GigaMIDI](https://huggingface.co/datasets/Metacreation/GigaMIDI) - Large-scale symbolic music dataset
-
-# gigamidi_support

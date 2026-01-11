@@ -1,0 +1,6 @@
+[submodule "jingyue_latents"]
+	path = jingyue_latents
+	url = https://github.com/pnlong/jingyue_latents
+[submodule "musetok"]
+	path = musetok
+	url = https://github.com/Yuer867/MuseTok
