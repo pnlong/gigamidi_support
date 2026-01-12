@@ -383,13 +383,13 @@ gdown.download(f'https://drive.google.com/uc?id={checkpoint_id}', output_path, q
 "
 ```
 
-Then extract the zip file and place `best_tokenizer.pt` directly in:
+Then extract the zip file and place `ckpt/best_tokenizer/model.pt` (renaming it to `best_tokenizer.pt`) directly in:
 ```
 /deepfreeze/pnlong/gigamidi/checkpoints/musetok/
 └── best_tokenizer.pt
 ```
 
-**Note**: The `best_tokenizer.pt` checkpoint is used for encoding/extracting latents. The `best_generator` checkpoint has been removed as it's not needed for this pipeline.
+**Note**: The `best_tokenizer/model.pt` checkpoint is used for encoding/extracting latents. The `best_generator/model.pt` checkpoint has been removed as it's not needed for this pipeline.
 
 ---
 

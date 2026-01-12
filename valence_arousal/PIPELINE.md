@@ -38,7 +38,7 @@ gdown.download(f'https://drive.google.com/uc?id={checkpoint_id}', output_path, q
 "
 ```
 
-Then extract the zip file and place `best_tokenizer.pt` directly in `checkpoints/musetok/`.
+Then extract the zip file and place `best_tokenizer/model.pt` directly in `checkpoints/musetok/` as `best_tokenizer.pt`.
 
 ---
 
