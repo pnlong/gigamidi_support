@@ -1,34 +1,40 @@
 """
 Prepare continuous valence/arousal labels from EMOPIA.
 
-ASSUMPTIONS ABOUT EMOPIA LABEL STRUCTURE:
-=========================================
-1. Label Storage Format:
-   - Labels might be in a CSV file (e.g., 'labels.csv', 'metadata.csv', 'emopia_labels.csv')
-   - Labels might be in a JSON file (e.g., 'labels.json', 'metadata.json')
-   - Labels might be encoded in filenames (e.g., 'happy_song1.mid', 'Q1_song1.mid')
-   - Labels might be in a separate directory structure matching MIDI files
-   
-2. Label Format:
-   - Emotion labels are categorical: 'happy', 'angry', 'sad', 'relax' (case-insensitive)
-   - Labels are per-song (not per-bar), so all bars in a song share the same emotion
-   - Each MIDI file has exactly one emotion label
-   
-3. File Matching:
-   - Labels are matched to MIDI files by filename (without extension)
-   - Filenames are unique identifiers
-   - If labels are in a CSV/JSON, there's a column/key for filename and emotion
-   
-4. Output Format:
-   - JSON file with structure: {filename: {"valence": float, "arousal": float}}
-   - If per_bar=True, structure: {filename: [{"bar": int, "valence": float, "arousal": float}, ...]}
-   - Filenames are without extension to match MIDI file stems
-   
-5. Missing Labels:
-   - If a MIDI file has no label, it's skipped (with warning)
-   - Unknown emotion labels are skipped (with warning)
+EMOPIA LABEL STRUCTURE:
+========================
 
-TODO: Update these assumptions as you learn more about EMOPIA's actual label structure.
+EMOTION LABEL EXTRACTION:
+- Primary method: Extract Q1-Q4 from filenames (works for both .pkl and .mid/.midi files)
+  * Q1 → happy (valence: 0.8, arousal: 0.6)
+  * Q2 → angry (valence: -0.6, arousal: 0.8)
+  * Q3 → sad (valence: -0.8, arousal: -0.4)
+  * Q4 → relax (valence: 0.4, arousal: -0.6)
+- Both edited EMOPIA and EMOPIA+ use the same Q1-Q4 naming convention
+- Examples: Q4_FyK_c-TIcCA_0.pkl → relax, Q1_0vLPYiPN7qY_0.mid → happy
+
+LABEL SOURCES (in priority order):
+1. Metadata files (for EMOPIA+): JSON/CSV files with emotion labels
+2. Filenames: Q1-Q4 extraction (most reliable, works for both variants)
+
+LABEL FORMAT:
+- Emotion labels are categorical: 'happy', 'angry', 'sad', 'relax'
+- Labels are per-song (not per-bar), so all bars in a song share the same emotion
+- Each file has exactly one emotion label (extracted from filename or metadata)
+
+FILE MATCHING:
+- Labels are matched to files by filename (without extension)
+- Works for both .pkl and .mid/.midi files
+- Filenames are unique identifiers
+
+OUTPUT FORMAT:
+- Default (per_bar=False): {filename: {"valence": float, "arousal": float}}
+- Per-bar (per_bar=True): {filename: [{"bar": int, "valence": float, "arousal": float}, ...]}
+- Filenames are without extension to match file stems
+
+MISSING LABELS:
+- If a file has no Q1-Q4 in filename and no metadata, it's skipped (with warning)
+- Unknown emotion labels are skipped (with warning)
 """
 
 import os
@@ -50,6 +56,14 @@ EMOTION_TO_VA = {
     "angry": {"valence": -0.6, "arousal": 0.8},
     "sad": {"valence": -0.8, "arousal": -0.4},
     "relax": {"valence": 0.4, "arousal": -0.6},
+}
+
+# Q1-Q4 to emotion mapping (from jingyue_latents)
+Q_TO_EMOTION = {
+    "Q1": "happy",
+    "Q2": "angry",
+    "Q3": "sad",
+    "Q4": "relax",
 }
 
 # Normalize emotion names (case-insensitive, handle variations)
@@ -180,38 +194,65 @@ def load_labels_from_json(emopia_dir: str) -> dict:
     return labels
 
 
+def extract_emotion_from_filename(filename: str) -> str:
+    """
+    Extract emotion label from filename.
+    
+    Supports both .pkl and .mid/.midi files with Q1-Q4 naming:
+    - Q1_*.pkl or Q1_*.mid → happy
+    - Q2_*.pkl or Q2_*.mid → angry
+    - Q3_*.pkl or Q3_*.mid → sad
+    - Q4_*.pkl or Q4_*.mid → relax
+    
+    Examples:
+    - Q4_FyK_c-TIcCA_0.pkl → relax
+    - Q1_0vLPYiPN7qY_0.mid → happy
+    
+    Also handles variations like Q1-*, Q1_*, etc.
+    """
+    import re
+    
+    # Match Q1, Q2, Q3, Q4 at start of filename
+    match = re.match(r'^Q([1-4])', filename.upper())
+    if match:
+        q_num = f"Q{match.group(1)}"
+        return Q_TO_EMOTION.get(q_num)
+    
+    # Also check if Q1-Q4 appears anywhere in filename
+    for q, emotion in Q_TO_EMOTION.items():
+        if q in filename.upper():
+            return emotion
+    
+    return None
+
 def load_labels_from_filenames(emopia_dir: str) -> dict:
     """
-    Try to extract labels from MIDI filenames.
+    Load EMOPIA labels by extracting Q1-Q4 from filenames.
     
-    Assumes format like: 'happy_song1.mid', 'Q1_song1.mid', 'song1_happy.mid', etc.
+    Works for both edited EMOPIA and EMOPIA+ where files are named like:
+    - Q4_FyK_c-TIcCA_0.pkl (REMI-encoded)
+    - Q1_0vLPYiPN7qY_0.mid (MIDI files)
+    
+    Both file types follow the same Q1-Q4 naming convention.
     """
     labels = {}
-    midi_files = []
     
-    for ext in ['*.mid', '*.midi', '*.MID', '*.MIDI']:
-        midi_files.extend(glob.glob(os.path.join(emopia_dir, ext)))
-        midi_files.extend(glob.glob(os.path.join(emopia_dir, '**', ext), recursive=True))
-    
-    for midi_path in midi_files:
-        filename = Path(midi_path).stem
-        
-        # Try to extract emotion from filename
-        # Check if emotion appears in filename
-        for emotion in EMOTION_TO_VA.keys():
-            if emotion.lower() in filename.lower():
+    # Find all .pkl and .mid/.midi files
+    for ext in ['*.pkl', '*.mid', '*.midi', '*.MID', '*.MIDI']:
+        for filepath in glob.glob(os.path.join(emopia_dir, ext), recursive=True):
+            filename = Path(filepath).stem
+            
+            # Try Q1-Q4 extraction first (most reliable for EMOPIA)
+            emotion = extract_emotion_from_filename(filename)
+            if emotion:
                 labels[filename] = emotion
-                break
-        
-        # Check for Q1, Q2, Q3, Q4 format (mapping to emotions)
-        if 'Q1' in filename.upper():
-            labels[filename] = 'happy'
-        elif 'Q2' in filename.upper():
-            labels[filename] = 'angry'
-        elif 'Q3' in filename.upper():
-            labels[filename] = 'sad'
-        elif 'Q4' in filename.upper():
-            labels[filename] = 'relax'
+                continue
+            
+            # Fallback: Check if emotion name appears in filename
+            for emotion_name in EMOTION_TO_VA.keys():
+                if emotion_name.lower() in filename.lower():
+                    labels[filename] = emotion_name
+                    break
     
     return labels
 

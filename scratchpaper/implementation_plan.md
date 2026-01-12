@@ -47,15 +47,22 @@ import torch
 # Base storage directory - modify this path as needed
 # This should point to a location with sufficient disk space
 STORAGE_DIR = os.environ.get("VALENCE_AROUSAL_STORAGE_DIR", 
-                             "/path/to/storage/valence_arousal")
+                             "/deepfreeze/pnlong/gigamidi")
 
 # Subdirectories within storage
 CHECKPOINTS_DIR = os.path.join(STORAGE_DIR, "checkpoints")
 EMOPIA_DATA_DIR = os.path.join(STORAGE_DIR, "emopia")
 GIGAMIDI_ANNOTATIONS_DIR = os.path.join(STORAGE_DIR, "gigamidi_annotations")
 
+# EMOPIA dataset paths
+# Edited EMOPIA (jingyue's version): REMI-encoded .pkl files
+EMOPIA_JINGYUE_DIR = "/deepfreeze/user_shares/jingyue/EMOPIA_data"
+# EMOPIA+ (original, full dataset): MIDI files and REMI representations
+EMOPIA_PLUS_DIR = os.path.join(EMOPIA_DATA_DIR, "emopia_plus")
+
 # Specific paths
 MUSETOK_CHECKPOINT_DIR = os.path.join(CHECKPOINTS_DIR, "musetok")
+MUSETOK_TOKENIZER_CHECKPOINT = os.path.join(MUSETOK_CHECKPOINT_DIR, "best_tokenizer.pt")
 TRAINED_MODEL_DIR = os.path.join(CHECKPOINTS_DIR, "trained_models")
 EMOPIA_LATENTS_DIR = os.path.join(EMOPIA_DATA_DIR, "latents")
 EMOPIA_LABELS_DIR = os.path.join(EMOPIA_DATA_DIR, "labels")
@@ -141,13 +148,17 @@ gdown>=4.7.0
 safetensors>=0.4.0
 numpy>=1.24.0
 pandas>=2.0.0
-scikit-learn>=1.3.0
+scipy>=1.10.0
 tqdm>=4.66.0
 wandb>=0.15.0
 matplotlib>=3.7.0
 seaborn>=0.12.0
-pyarrow>=12.0.0
 ```
+
+**Note**: 
+- `pyarrow` removed: Only needed for optional parquet export (not used in main pipeline)
+- `scikit-learn` removed: Not directly used (only `scipy.stats` for correlation is needed)
+- `scipy` added: Required for `scipy.stats.pearsonr` used in training/evaluation
 
 ### Step 1.4: Create `utils/midi_utils.py` - Symusic MIDI Processing
 
@@ -173,12 +184,29 @@ DEFAULT_BPM_BINS = np.linspace(32, 224, 64 + 1, dtype=int)
 DEFAULT_SHIFT_BINS = np.linspace(-TICK_RESOL, TICK_RESOL, TICK_RESOL + 1, dtype=int)
 DEFAULT_TIME_SIGNATURE = ['4/4', '2/4', '3/4', '2/2', '3/8', '6/8']
 
-def load_midi_symusic(midi_path_or_bytes: Union[str, bytes]) -> Score:
-    """Load MIDI file using symusic."""
+def load_midi_symusic(midi_path_or_bytes: Union[str, bytes], exclude_tracks: List[str] = None) -> Score:
+    """
+    Load MIDI file using symusic.
+    
+    Args:
+        midi_path_or_bytes: Path to MIDI file or MIDI bytes
+        exclude_tracks: List of track names to exclude (e.g., ['Chord'] for EMOPIA)
+    
+    Returns:
+        Score object with MIDI data
+    """
     if isinstance(midi_path_or_bytes, bytes):
-        return Score.from_midi(midi_path_or_bytes)
+        score = Score.from_midi(midi_path_or_bytes)
     else:
-        return Score(midi_path_or_bytes)
+        score = Score(midi_path_or_bytes)
+    
+    # For EMOPIA MIDI files: exclude Chord track, keep Melody + Texture + Bass
+    if exclude_tracks:
+        # Implementation: filter out tracks matching exclude_tracks names
+        # This ensures we use all tracks except Chord for emotion prediction
+        pass
+    
+    return score
 
 def get_time_signature(score: Score) -> Tuple[int, int]:
     """Extract time signature from score."""
@@ -221,6 +249,10 @@ def get_bar_positions(events: List[Dict[str, any]]) -> List[int]:
 - Study `musetok/data_processing/midi2events.py` carefully
 - Replicate the quantization and event creation logic
 - Test with sample MIDI files to ensure output matches expected REMI format
+- **EMOPIA MIDI Track Handling**: For EMOPIA MIDI files (4 tracks: Melody, Texture, Bass, Chord):
+  - When loading MIDI, merge Melody + Texture + Bass tracks
+  - Exclude Chord track for emotion prediction
+  - This can be done by filtering tracks in `load_midi_symusic()` or during `midi_to_events_symusic()`
 
 ### Step 1.5: Create `utils/musetok_utils.py` - MuseTok Integration
 
@@ -253,16 +285,20 @@ def load_musetok_model(checkpoint_path: Optional[str] = None,
     Load pre-trained MuseTok model.
     
     Args:
-        checkpoint_path: Path to model checkpoint (defaults to MUSETOK_CHECKPOINT_DIR)
+        checkpoint_path: Path to model checkpoint (defaults to MUSETOK_CHECKPOINT_DIR/best_tokenizer.pt)
         vocab_path: Path to vocabulary file (defaults to musetok/data/dictionary.pkl)
         device: Device to load model on
     
     Returns:
         model: Loaded MuseTokEncoder
         vocab: Vocabulary dictionary
+    
+    Note: The default checkpoint path points to best_tokenizer.pt, which is used for
+    encoding/extracting latents.
     """
     # Implementation:
     # 1. Set default paths if not provided
+    #    - checkpoint_path defaults to MUSETOK_CHECKPOINT_DIR/best_tokenizer.pt
     # 2. Load vocabulary
     # 3. Initialize and load MuseTokEncoder
     # 4. Move to device
@@ -279,17 +315,28 @@ def extract_latents_from_events(events: List[Dict],
                                 vocab: dict,
                                 device: str = 'cuda') -> np.ndarray:
     """
-    Extract MuseTok latents from REMI events.
+    Extract MuseTok latents from REMI events (for pre-encoded REMI files).
+    
+    This is used when processing .pkl files that already contain REMI events,
+    skipping the MIDI → REMI conversion step.
+    
+    Args:
+        events: List of REMI event dictionaries with 'name' and 'value' keys
+        bar_positions: List of event indices where bars start
+        model: Loaded MuseTokEncoder
+        vocab: Vocabulary dictionary
+        device: Device to use
     
     Returns:
         latents: numpy array of shape (n_bars, d_vae_latent)
     """
     # Implementation:
-    # 1. Convert events to tokens
+    # 1. Convert events to tokens using vocab
     # 2. Prepare input for MuseTok (handle segments if >16 bars)
     # 3. Call model.get_batch_latent() or model.get_sampled_latent()
     # 4. Reshape to (n_bars, d_vae_latent)
     # 5. Convert to numpy
+    # Note: This is similar to extract_latents_from_midi but skips MIDI loading/conversion
     pass
 
 def extract_latents_from_midi(midi_path_or_bytes: Union[str, bytes],
@@ -315,6 +362,8 @@ def extract_latents_from_midi(midi_path_or_bytes: Union[str, bytes],
 - Study `musetok/encoding.py` to understand MuseTokEncoder API
 - Handle songs with >16 bars by processing in segments
 - Test with sample MIDI files
+- `extract_latents_from_events()` is crucial for processing pre-encoded REMI files (.pkl)
+- Both functions should produce identical latents for the same REMI events
 
 ### Step 1.6: Download MuseTok Checkpoints
 
@@ -334,19 +383,81 @@ gdown.download(f'https://drive.google.com/uc?id={checkpoint_id}', output_path, q
 "
 ```
 
-Then extract the zip file and verify structure.
+Then extract the zip file and place `best_tokenizer.pt` directly in:
+```
+/deepfreeze/pnlong/gigamidi/checkpoints/musetok/
+└── best_tokenizer.pt
+```
+
+**Note**: The `best_tokenizer.pt` checkpoint is used for encoding/extracting latents. The `best_generator` checkpoint has been removed as it's not needed for this pipeline.
 
 ---
 
 ## Phase 2: EMOPIA Preprocessing
 
+**UPDATE**: This phase has been refactored to support both edited EMOPIA and EMOPIA+ datasets. The key changes are:
+
+1. **Smart File Detection**: Automatically detects `.pkl` (REMI-encoded) vs `.mid/.midi` (MIDI) files
+2. **Dual Processing Paths**: 
+   - `.pkl` files → Load REMI directly → Extract latents (skip MIDI conversion)
+   - `.mid/.midi` files → Full pipeline (MIDI → REMI → latents)
+3. **Emotion Label Extraction**: Supports Q1-Q4 from filenames (edited EMOPIA) and metadata (EMOPIA+)
+4. **EMOPIA+ Structure Support**: Handles train/val/test splits and REMI/ subdirectories
+
+### Step 2.0: Understanding EMOPIA Dataset Variants
+
+**Important**: There are two EMOPIA dataset variants that need to be supported:
+
+#### Variant 1: Edited EMOPIA (jingyue's version)
+- **Location**: `/deepfreeze/user_shares/jingyue/EMOPIA_data` (direct path, no symlink)
+- **Format**: Files are already REMI-encoded as `.pkl` files
+- **Naming**: Files named like `Q4_FyK_c-TIcCA_0.pkl` or `Q1_0vLPYiPN7qY_0.mid` where:
+  - `Q1`, `Q2`, `Q3`, `Q4` indicate emotion labels (see mapping below)
+  - The rest is the song identifier
+  - **Note**: Both `.pkl` and `.mid/.midi` files follow this naming convention
+- **Processing**: 
+  - `.pkl` files: Skip MIDI loading, directly load REMI events from pickle files
+  - `.mid/.midi` files: Run full MIDI → REMI → latents pipeline
+- **Emotion Mapping** (from jingyue_latents):
+  - `Q1` → `happy`
+  - `Q2` → `angry`
+  - `Q3` → `sad`
+  - `Q4` → `relax`
+
+#### Variant 2: EMOPIA+ (original, full dataset)
+- **Location**: `/deepfreeze/pnlong/gigamidi/emopia/emopia_plus` (downloaded to storage directory)
+- **Format**: Contains MIDI files in `midis/` directory
+- **Structure**:
+  - `midis/`: Processed MIDI clips (4 tracks: Melody, Texture, Bass, Chord)
+    - **Note**: For emotion prediction, use all tracks except Chord track to obtain the mix
+  - `REMI/`: REMI representations (already available, same structure as `midis/`)
+  - `split/`: Train/val/test splits
+  - `functional/`: Functional representations
+  - `performance/`: Performance events
+  - `lead_sheet/`: Lead sheet events
+- **Naming**: MIDI files also follow Q1-Q4 naming convention (e.g., `Q1_0vLPYiPN7qY_0.mid`)
+- **Processing**: Can use either:
+  - MIDI files → convert to REMI → extract latents (full pipeline)
+    - When processing MIDI, merge Melody + Texture + Bass tracks (exclude Chord track)
+  - REMI files → extract latents directly (skip MIDI conversion)
+
+**Smart File Detection Strategy**:
+- If file ends with `.pkl`: Assume already REMI-encoded, load directly
+- If file ends with `.mid` or `.midi`: Assume MIDI format, run full pipeline
+- This allows processing both variants with the same codebase
+
 ### Step 2.1: Create `pretrain_model/preprocess_emopia.py`
 
 **File**: `valence_arousal/pretrain_model/preprocess_emopia.py`
 
-**Purpose**: Extract MuseTok latents from EMOPIA MIDI files.
+**Purpose**: Extract MuseTok latents from EMOPIA files (supports both `.pkl` REMI files and `.mid/.midi` MIDI files).
 
-**Note**: Includes `--resume` argument to skip files that have already been processed (by checking for existing `.safetensors` output files).
+**Key Features**:
+- Smart file type detection (`.pkl` vs `.mid/.midi`)
+- For `.pkl` files: Load REMI events directly, skip MIDI conversion
+- For `.mid/.midi` files: Run full MIDI → REMI → latents pipeline
+- Includes `--resume` argument to skip files that have already been processed (by checking for existing `.safetensors` output files)
+- Support for EMOPIA+ split structure (train/val/test directories)
 
 **Code structure**:
 
@@ -358,41 +469,100 @@ from pathlib import Path
 from tqdm import tqdm
 from multiprocessing import Pool
 import sys
+import pickle
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from utils.data_utils import (
-    EMOPIA_LATENTS_DIR, ensure_dir, save_latents, 
+    EMOPIA_LATENTS_DIR, ensure_dir, save_latents, load_pickle,
     MUSETOK_CHECKPOINT_DIR
 )
-from utils.musetok_utils import load_musetok_model, extract_latents_from_midi
-from utils.midi_utils import load_midi_symusic
+from utils.musetok_utils import (
+    load_musetok_model, extract_latents_from_midi, 
+    extract_latents_from_events
+)
+from utils.midi_utils import load_midi_symusic, get_bar_positions
+
+def is_remi_file(filepath: str) -> bool:
+    """Check if file is a REMI-encoded pickle file."""
+    return filepath.endswith('.pkl')
+
+def is_midi_file(filepath: str) -> bool:
+    """Check if file is a MIDI file."""
+    return filepath.lower().endswith(('.mid', '.midi'))
+
+def load_remi_from_pickle(pkl_path: str):
+    """
+    Load REMI events from pickle file.
+    
+    Returns:
+        events: List of REMI event dictionaries
+        bar_positions: List of bar boundary positions (extracted from events)
+    """
+    data = load_pickle(pkl_path)
+    
+    # Handle different pickle formats:
+    # - Could be just events list
+    # - Could be dict with 'events' key
+    # - Could be dict with 'events' and 'bar_positions' keys
+    if isinstance(data, list):
+        events = data
+        bar_positions = get_bar_positions(events)
+    elif isinstance(data, dict):
+        events = data.get('events', data.get('remi', data))
+        if not isinstance(events, list):
+            raise ValueError(f"Unexpected pickle format in {pkl_path}")
+        bar_positions = data.get('bar_positions', get_bar_positions(events))
+    else:
+        raise ValueError(f"Unexpected pickle format in {pkl_path}")
+    
+    return events, bar_positions
 
 def process_single_file(args_tuple):
-    """Process a single MIDI file (for multiprocessing)."""
-    midi_path, output_dir, model, vocab, device = args_tuple
+    """
+    Process a single file (MIDI or REMI pickle).
+    
+    Supports:
+    - .pkl files: Load REMI events directly, extract latents
+    - .mid/.midi files: Load MIDI, convert to REMI, extract latents
+    """
+    file_path, output_dir, model, vocab, device = args_tuple
     try:
-        # Load MIDI
-        score = load_midi_symusic(midi_path)
+        filename = Path(file_path).stem
+        output_path = os.path.join(output_dir, f"{filename}.safetensors")
         
-        # Extract latents
-        latents, bar_positions = extract_latents_from_midi(
-            midi_path, model, vocab, device
-        )
+        # Check file type and process accordingly
+        if is_remi_file(file_path):
+            # Load REMI events directly from pickle
+            events, bar_positions = load_remi_from_pickle(file_path)
+            
+            # Extract latents from REMI events
+            latents = extract_latents_from_events(
+                events, bar_positions, model, vocab, device
+            )
+            
+        elif is_midi_file(file_path):
+            # Full pipeline: MIDI → REMI → latents
+            # Note: For EMOPIA MIDI files, merge Melody + Texture + Bass tracks
+            # (exclude Chord track) when loading MIDI
+            latents, bar_positions = extract_latents_from_midi(
+                file_path, model, vocab, device
+            )
+        else:
+            return (filename, False, f"Unsupported file type: {file_path}")
         
         # Save latents
-        filename = Path(midi_path).stem
-        output_path = os.path.join(output_dir, f"{filename}.safetensors")
         metadata = {
             "n_bars": len(latents),
-            "original_midi_path": str(midi_path),
+            "original_file_path": str(file_path),
+            "file_type": "remi_pkl" if is_remi_file(file_path) else "midi",
             "bar_positions": bar_positions
         }
         save_latents(output_path, latents, metadata)
         
         return (filename, True, None)
     except Exception as e:
-        return (Path(midi_path).stem, False, str(e))
+        return (Path(file_path).stem, False, str(e))
 
 def get_processed_files(output_dir: str):
     """Get set of already-processed files by checking for existing safetensors files."""
@@ -406,42 +576,85 @@ def get_processed_files(output_dir: str):
                     processed.add(filename)
     return processed
 
+def find_emopia_files(emopia_dir: str, use_remi_dir: bool = False):
+    """
+    Find all EMOPIA files (both .pkl and .mid/.midi).
+    
+    Args:
+        emopia_dir: Base EMOPIA directory
+        use_remi_dir: If True and EMOPIA+ structure, look in REMI/ subdirectory
+    
+    Returns:
+        List of file paths
+    """
+    files = []
+    
+    # Check for EMOPIA+ structure
+    remi_dir = os.path.join(emopia_dir, "REMI")
+    midis_dir = os.path.join(emopia_dir, "midis")
+    
+    if use_remi_dir and os.path.exists(remi_dir):
+        # EMOPIA+ structure: use REMI directory
+        search_dir = remi_dir
+    elif os.path.exists(midis_dir):
+        # EMOPIA+ structure: use midis directory
+        search_dir = midis_dir
+    else:
+        # Edited EMOPIA or flat structure: use base directory
+        search_dir = emopia_dir
+    
+    # Find all .pkl and .mid/.midi files recursively
+    for root, dirs, filenames in os.walk(search_dir):
+        for filename in filenames:
+            filepath = os.path.join(root, filename)
+            if is_remi_file(filepath) or is_midi_file(filepath):
+                files.append(filepath)
+    
+    return files
+
 def preprocess_emopia(emopia_dir: str,
                      output_dir: str,
                      checkpoint_path: str,
                      vocab_path: str,
                      device: str = 'cuda',
                      num_workers: int = 4,
-                     resume: bool = False):
+                     resume: bool = False,
+                     use_remi_dir: bool = False,
+                     split: str = None):
     """
-    Preprocess EMOPIA dataset.
+    Preprocess EMOPIA dataset (supports both edited EMOPIA and EMOPIA+).
     
     Args:
-        emopia_dir: Directory containing EMOPIA MIDI files
+        emopia_dir: Directory containing EMOPIA files (or base directory for EMOPIA+)
         output_dir: Output directory for latents
         checkpoint_path: Path to MuseTok checkpoint
         vocab_path: Path to vocabulary file
         device: Device to use
         num_workers: Number of parallel workers
         resume: If True, skip files that have already been processed
+        use_remi_dir: If True and EMOPIA+ structure, use REMI/ subdirectory
+        split: If provided, process only this split (train/valid/test) for EMOPIA+
     """
     # Implementation:
     # 1. Load MuseTok model (once, before multiprocessing)
-    # 2. Find all MIDI files in emopia_dir (recursively)
+    # 2. Find all files (.pkl and .mid/.midi) in emopia_dir
+    #    - If split is provided, look in emopia_dir/split/ or emopia_dir/REMI/split/
     # 3. If resume=True:
     #    - Call get_processed_files() to get set of already-processed filenames
-    #    - Filter out MIDI files whose output already exists
+    #    - Filter out files whose output already exists
     #    - Log how many files are being skipped
-    # 4. Create output directories for train/valid/test splits (if needed)
+    # 4. Create output directories (preserve split structure if EMOPIA+)
     # 5. Prepare arguments for multiprocessing (each worker needs model, vocab, device)
     #    Note: Model loading in multiprocessing may need special handling (e.g., load per worker)
     # 6. Process files in parallel using Pool
     # 7. Collect results and log statistics (successful, failed, skipped)
+    #    - Log counts for .pkl vs .mid/.midi files separately
     pass
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--emopia_dir", required=True, help="EMOPIA dataset directory")
+    parser.add_argument("--emopia_dir", required=True, 
+                       help="EMOPIA dataset directory (or base directory for EMOPIA+)")
     parser.add_argument("--output_dir", default=EMOPIA_LATENTS_DIR)
     parser.add_argument("--checkpoint_path", default=None)
     parser.add_argument("--vocab_path", default=None)
@@ -449,11 +662,17 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--resume", action="store_true", default=False,
                        help="Resume preprocessing: skip files that have already been processed")
+    parser.add_argument("--use_remi_dir", action="store_true", default=False,
+                       help="For EMOPIA+: use REMI/ subdirectory instead of midis/")
+    parser.add_argument("--split", type=str, default=None,
+                       choices=["train", "valid", "test"],
+                       help="For EMOPIA+: process only this split")
     args = parser.parse_args()
     
     preprocess_emopia(
         args.emopia_dir, args.output_dir, args.checkpoint_path,
-        args.vocab_path, args.device, args.num_workers, args.resume
+        args.vocab_path, args.device, args.num_workers, args.resume,
+        args.use_remi_dir, args.split
     )
 ```
 
@@ -465,6 +684,14 @@ if __name__ == "__main__":
 
 **Purpose**: Convert EMOPIA categorical labels to continuous VA values.
 
+**Key Features**:
+- Supports both edited EMOPIA (Q1-Q4 from filenames) and EMOPIA+ (from metadata/splits)
+- Extracts emotion labels from:
+  - Filenames: `Q1_*.pkl` or `Q1_*.mid` → `happy`, `Q2_*.pkl` or `Q2_*.mid` → `angry`, etc.
+    - Works for both `.pkl` and `.mid/.midi` files (both use Q1-Q4 naming)
+  - EMOPIA+ metadata files (if available)
+  - Split directories (for EMOPIA+)
+
 **Code structure**:
 
 ```python
@@ -474,6 +701,8 @@ import json
 import argparse
 from pathlib import Path
 import sys
+import re
+import glob
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
@@ -487,36 +716,182 @@ EMOTION_TO_VA = {
     "relax": {"valence": 0.4, "arousal": -0.6},
 }
 
-def load_emopia_labels(emopia_dir: str) -> dict:
-    """Load EMOPIA emotion labels."""
-    # Implementation: load EMOPIA metadata/labels
-    # Format: {filename: emotion_label}
-    pass
+# Q1-Q4 to emotion mapping (from jingyue_latents)
+Q_TO_EMOTION = {
+    "Q1": "happy",
+    "Q2": "angry",
+    "Q3": "sad",
+    "Q4": "relax",
+}
 
-def prepare_labels(emopia_dir: str, output_path: str, per_bar: bool = False):
+def extract_emotion_from_filename(filename: str) -> str:
+    """
+    Extract emotion label from filename.
+    
+    Supports both .pkl and .mid/.midi files with Q1-Q4 naming:
+    - Q1_*.pkl or Q1_*.mid → happy
+    - Q2_*.pkl or Q2_*.mid → angry
+    - Q3_*.pkl or Q3_*.mid → sad
+    - Q4_*.pkl or Q4_*.mid → relax
+    
+    Examples:
+    - Q4_FyK_c-TIcCA_0.pkl → relax
+    - Q1_0vLPYiPN7qY_0.mid → happy
+    
+    Also handles variations like Q1-*, Q1_*, etc.
+    """
+    # Match Q1, Q2, Q3, Q4 at start of filename
+    match = re.match(r'^Q([1-4])', filename.upper())
+    if match:
+        q_num = f"Q{match.group(1)}"
+        return Q_TO_EMOTION.get(q_num)
+    
+    # Also check if Q1-Q4 appears anywhere in filename
+    for q, emotion in Q_TO_EMOTION.items():
+        if q in filename.upper():
+            return emotion
+    
+    return None
+
+def load_emopia_labels_from_filenames(emopia_dir: str) -> dict:
+    """
+    Load EMOPIA labels by extracting Q1-Q4 from filenames.
+    
+    Works for both edited EMOPIA and EMOPIA+ where files are named like:
+    - Q4_FyK_c-TIcCA_0.pkl (REMI-encoded)
+    - Q1_0vLPYiPN7qY_0.mid (MIDI files)
+    
+    Both file types follow the same Q1-Q4 naming convention.
+    """
+    labels = {}
+    
+    # Find all .pkl and .mid/.midi files
+    for ext in ['*.pkl', '*.mid', '*.midi', '*.MID', '*.MIDI']:
+        for filepath in glob.glob(os.path.join(emopia_dir, ext), recursive=True):
+            filename = Path(filepath).stem
+            emotion = extract_emotion_from_filename(filename)
+            if emotion:
+                labels[filename] = emotion
+    
+    return labels
+
+def load_emopia_labels_from_metadata(emopia_dir: str) -> dict:
+    """
+    Load EMOPIA+ labels from metadata files (if available).
+    
+    EMOPIA+ may have metadata files with emotion labels.
+    """
+    labels = {}
+    
+    # Check for common metadata file locations
+    metadata_paths = [
+        os.path.join(emopia_dir, "metadata.json"),
+        os.path.join(emopia_dir, "labels.json"),
+        os.path.join(emopia_dir, "emopia_labels.json"),
+    ]
+    
+    for metadata_path in metadata_paths:
+        if os.path.exists(metadata_path):
+            try:
+                with open(metadata_path, 'r') as f:
+                    metadata = json.load(f)
+                    # Try different possible structures
+                    if isinstance(metadata, dict):
+                        for key, value in metadata.items():
+                            if isinstance(value, dict) and 'emotion' in value:
+                                labels[key] = value['emotion']
+                            elif isinstance(value, str):
+                                # Assume value is emotion
+                                labels[key] = value
+            except Exception as e:
+                print(f"Warning: Could not load metadata from {metadata_path}: {e}")
+    
+    return labels
+
+def load_emopia_labels(emopia_dir: str) -> dict:
+    """
+    Load EMOPIA emotion labels from multiple sources.
+    
+    Priority:
+    1. Metadata files (for EMOPIA+)
+    2. Filenames (for edited EMOPIA with Q1-Q4)
+    """
+    labels = {}
+    
+    # Try metadata first (EMOPIA+)
+    metadata_labels = load_emopia_labels_from_metadata(emopia_dir)
+    if metadata_labels:
+        labels.update(metadata_labels)
+    
+    # Also try filenames (edited EMOPIA)
+    filename_labels = load_emopia_labels_from_filenames(emopia_dir)
+    labels.update(filename_labels)  # Filenames override metadata if conflict
+    
+    return labels
+
+def prepare_labels(emopia_dir: str, output_path: str, per_bar: bool = False, latents_dir: str = None):
     """
     Prepare continuous VA labels from EMOPIA.
     
     Args:
         emopia_dir: EMOPIA dataset directory
         output_path: Output JSON file path
-        per_bar: Whether to create per-bar labels (if available)
+        per_bar: Whether to create per-bar labels (requires latents_dir)
+        latents_dir: Directory containing preprocessed latents (needed for per_bar=True)
     """
     # Implementation:
-    # 1. Load EMOPIA labels
+    # 1. Load EMOPIA labels (from filenames or metadata)
     # 2. Map emotions to VA values
     # 3. If per_bar=False, use same VA for all bars
-    # 4. Save to JSON
+    # 4. If per_bar=True, load latents to get bar counts, create per-bar labels
+    # 5. Save to JSON
     pass
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--emopia_dir", required=True)
+    parser.add_argument("--emopia_dir", required=True,
+                       help="EMOPIA dataset directory")
     parser.add_argument("--output_path", default=os.path.join(EMOPIA_LABELS_DIR, "va_labels.json"))
-    parser.add_argument("--per_bar", action="store_true")
+    parser.add_argument("--per_bar", action="store_true",
+                       help="Create per-bar labels (requires --latents_dir)")
+    parser.add_argument("--latents_dir", type=str, default=None,
+                       help="Directory containing preprocessed latents (for per_bar=True)")
     args = parser.parse_args()
     
-    prepare_labels(args.emopia_dir, args.output_path, args.per_bar)
+    prepare_labels(args.emopia_dir, args.output_path, args.per_bar, args.latents_dir)
+```
+
+**Usage Examples**:
+
+```bash
+# Process edited EMOPIA (jingyue's version, Q1-Q4 .pkl files)
+python pretrain_model/preprocess_emopia.py \
+    --emopia_dir /deepfreeze/user_shares/jingyue/EMOPIA_data \
+    --output_dir /deepfreeze/pnlong/gigamidi/emopia/latents/jingyue \
+    --resume
+
+# Process EMOPIA+ (using REMI directory)
+python pretrain_model/preprocess_emopia.py \
+    --emopia_dir /deepfreeze/pnlong/gigamidi/emopia/emopia_plus \
+    --output_dir /deepfreeze/pnlong/gigamidi/emopia/latents/emopia_plus \
+    --use_remi_dir \
+    --split train
+
+# Process EMOPIA+ (using MIDI files, full pipeline)
+python pretrain_model/preprocess_emopia.py \
+    --emopia_dir /deepfreeze/pnlong/gigamidi/emopia/emopia_plus \
+    --output_dir /deepfreeze/pnlong/gigamidi/emopia/latents/emopia_plus \
+    --split train
+
+# Prepare labels from edited EMOPIA (extracts Q1-Q4 from filenames)
+python pretrain_model/prepare_labels.py \
+    --emopia_dir /deepfreeze/user_shares/jingyue/EMOPIA_data \
+    --output_path /deepfreeze/pnlong/gigamidi/emopia/labels/jingyue_va_labels.json
+
+# Prepare labels from EMOPIA+ (uses metadata if available, falls back to filenames)
+python pretrain_model/prepare_labels.py \
+    --emopia_dir /deepfreeze/pnlong/gigamidi/emopia/emopia_plus \
+    --output_path /deepfreeze/pnlong/gigamidi/emopia/labels/emopia_plus_va_labels.json
 ```
 
 ---
@@ -1415,7 +1790,7 @@ def parse_args():
     parser.add_argument("--model_path", type=str, required=True,
                        help="Path to trained VA model checkpoint")
     parser.add_argument("--checkpoint_path", type=str, default=None,
-                       help="Path to MuseTok checkpoint")
+                       help="Path to MuseTok checkpoint (defaults to MUSETOK_CHECKPOINT_DIR/best_tokenizer.pt)")
     parser.add_argument("--vocab_path", type=str, default=None,
                        help="Path to MuseTok vocabulary")
     parser.add_argument("--input_dim", type=int, default=128,

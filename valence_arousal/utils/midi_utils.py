@@ -13,6 +13,7 @@ from symusic import Score
 from typing import Union, List, Dict, Tuple, Optional
 from copy import deepcopy
 import collections
+import logging
 
 # Constants from musetok/data_processing/midi2events.py
 BEAT_RESOL = 480
@@ -93,33 +94,95 @@ def check_triplet(start, quantized_timing, bar_resol):
         return False
 
 
+def convert_ticks_per_quarter(score: Score, target_ticks_per_quarter: int = BEAT_RESOL) -> Score:
+    """
+    Convert score to target ticks_per_quarter by scaling all timing values.
+    
+    This replicates the tick_change logic from musetok/data_processing/midi2events.py.
+    All timing values (note start/end, tempo changes, time signature changes) are scaled
+    proportionally: new_time = old_time * (target_ticks / orig_ticks)
+    
+    Args:
+        score: symusic Score object
+        target_ticks_per_quarter: Target ticks per quarter note (default: 480)
+    
+    Returns:
+        Score object with converted ticks_per_quarter (may be same object if modified in-place)
+    """
+    if score.ticks_per_quarter == target_ticks_per_quarter:
+        return score
+    
+    orig_ticks = score.ticks_per_quarter
+    scale_factor = target_ticks_per_quarter / orig_ticks
+    
+    # Scale all timing values in the score
+    # Scale time signatures
+    for ts in score.time_signatures:
+        ts.time = int(ts.time * scale_factor)
+    
+    # Scale tempo changes
+    for tempo in score.tempos:
+        tempo.time = int(tempo.time * scale_factor)
+    
+    # Scale all notes in all tracks
+    for track in score.tracks:
+        # Scale note timings
+        for note in track.notes:
+            new_start = int(note.start * scale_factor)
+            orig_duration = note.end - note.start
+            new_duration = int(orig_duration * scale_factor)
+            note.start = new_start
+            note.end = new_start + new_duration
+        
+        # Scale control changes
+        for cc in track.controls:
+            cc.time = int(cc.time * scale_factor)
+    
+    # Update ticks_per_quarter
+    score.ticks_per_quarter = target_ticks_per_quarter
+    
+    return score
+
+
 def tick_scaling_symusic(score: Score, target_ticks_per_beat: int = BEAT_RESOL) -> Score:
     """
     Scale score to target ticks_per_beat (from midi2events.py tick_change logic).
     
-    Note: symusic handles this automatically, but we verify ticks_per_beat matches.
+    This is a wrapper that calls convert_ticks_per_quarter for backward compatibility.
     """
-    if score.ticks_per_quarter != target_ticks_per_beat:
-        # symusic should handle conversion, but we'll create a new score if needed
-        # For now, just verify and raise if mismatch
-        raise ValueError(f"Score has ticks_per_quarter={score.ticks_per_quarter}, expected {target_ticks_per_beat}. "
-                        f"Consider converting the MIDI file first.")
-    return score
+    return convert_ticks_per_quarter(score, target_ticks_per_beat)
 
 
-def load_midi_symusic(midi_path_or_bytes: Union[str, bytes]) -> Score:
-    """Load MIDI file using symusic."""
+def load_midi_symusic(midi_path_or_bytes: Union[str, bytes], exclude_tracks: Optional[List[str]] = None) -> Score:
+    """
+    Load MIDI file using symusic.
+    
+    Args:
+        midi_path_or_bytes: Path to MIDI file or MIDI bytes
+        exclude_tracks: List of track names to exclude (e.g., ['Chord'] for EMOPIA)
+    
+    Returns:
+        Score object with MIDI data
+    """
     if isinstance(midi_path_or_bytes, bytes):
         score = Score.from_midi(midi_path_or_bytes)
     else:
         score = Score(midi_path_or_bytes)
     
-    # Ensure ticks_per_quarter is 480 (BEAT_RESOL)
+    # For EMOPIA MIDI files: exclude Chord track, keep Melody + Texture + Bass
+    if exclude_tracks:
+        # Filter out tracks matching exclude_tracks names
+        # This ensures we use all tracks except Chord for emotion prediction
+        # Note: symusic Score tracks might be immutable, so we filter during processing
+        # The actual filtering happens in score_to_corpus_strict when processing notes
+        # Store exclude_tracks in score metadata for later use
+        if not hasattr(score, '_exclude_tracks'):
+            score._exclude_tracks = exclude_tracks
+    
+    # Convert ticks_per_quarter to 480 (BEAT_RESOL) if needed
     if score.ticks_per_quarter != BEAT_RESOL:
-        # Note: symusic doesn't have a direct conversion method like miditoolkit
-        # We may need to handle this differently or require pre-converted MIDI files
-        # For now, we'll proceed but this might cause issues
-        pass
+        logging.debug(f"Converting MIDI from {score.ticks_per_quarter} to {BEAT_RESOL} ticks_per_quarter")
+        score = convert_ticks_per_quarter(score, BEAT_RESOL)
     
     return score
 
@@ -163,22 +226,34 @@ def score_to_corpus_strict(score: Score, bar_resol: int, remove_overlap: bool = 
     
     # Collect all notes from all tracks
     # Note: symusic API - tracks is a list, each track has notes
+    # For EMOPIA: exclude Chord track if specified
+    exclude_tracks = getattr(score, '_exclude_tracks', None)
+    
     all_notes = []
     for track in score.tracks:
         # Filter for piano tracks (or accept all if no name filtering)
         # For now, we'll take all non-drum tracks
         # Check if track has is_drum attribute, otherwise include all
         is_drum = getattr(track, 'is_drum', False)
-        if not is_drum:
-            # Access notes from track
-            track_notes = getattr(track, 'notes', [])
-            for note in track_notes:
-                all_notes.append({
-                    'start': int(note.start),
-                    'end': int(note.end),
-                    'pitch': int(note.pitch),
-                    'velocity': int(note.velocity),
-                })
+        if is_drum:
+            continue
+        
+        # Check if track should be excluded (e.g., Chord track for EMOPIA)
+        if exclude_tracks:
+            track_name = getattr(track, 'name', '').lower()
+            should_exclude = any(excluded.lower() in track_name for excluded in exclude_tracks)
+            if should_exclude:
+                continue
+        
+        # Access notes from track
+        track_notes = getattr(track, 'notes', [])
+        for note in track_notes:
+            all_notes.append({
+                'start': int(note.start),
+                'end': int(note.end),
+                'pitch': int(note.pitch),
+                'velocity': int(note.velocity),
+            })
     
     if len(all_notes) == 0:
         raise ValueError('Detected empty MIDI file!')
@@ -516,12 +591,10 @@ def midi_to_events_symusic(score: Score,
         bar_positions: List of event indices where bars start
         events: List of event dictionaries with 'name' and 'value' keys
     """
-    # Ensure ticks_per_quarter is 480
+    # Ensure ticks_per_quarter is 480 (should already be converted in load_midi_symusic)
     if score.ticks_per_quarter != BEAT_RESOL:
-        # Note: symusic doesn't easily convert ticks_per_quarter
-        # We may need to handle this at the MIDI loading stage
-        # For now, we'll proceed but results may be incorrect
-        pass
+        logging.warning(f"Score has ticks_per_quarter={score.ticks_per_quarter}, expected {BEAT_RESOL}. Converting...")
+        score = convert_ticks_per_quarter(score, BEAT_RESOL)
     
     # Get time signature and compute bar_resol
     time_sig_num, time_sig_den = get_time_signature(score)

@@ -32,7 +32,7 @@ def parse_args():
     parser.add_argument("--model_path", type=str, required=True,
                        help="Path to trained VA model checkpoint")
     parser.add_argument("--checkpoint_path", type=str, default=None,
-                       help="Path to MuseTok checkpoint")
+                       help="Path to MuseTok checkpoint (defaults to MUSETOK_CHECKPOINT_DIR/best_tokenizer.pt)")
     parser.add_argument("--vocab_path", type=str, default=None,
                        help="Path to MuseTok vocabulary")
     parser.add_argument("--input_dim", type=int, default=128,

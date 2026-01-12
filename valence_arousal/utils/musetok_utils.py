@@ -48,11 +48,13 @@ def load_musetok_model(checkpoint_path: Optional[str] = None,
     Load pre-trained MuseTok model.
     
     Args:
-        checkpoint_path: Path to model checkpoint (defaults to MUSETOK_CHECKPOINT_DIR/model.pt)
+        checkpoint_path: Path to model checkpoint (defaults to MUSETOK_CHECKPOINT_DIR/best_tokenizer.pt)
         vocab_path: Path to vocabulary file (defaults to musetok/data/dictionary.pkl)
         device: Device to load model on ('cuda' or 'cpu')
         model_enc_seqlen: Maximum sequence length per bar (default: 128)
         model_max_bars: Maximum bars per segment (default: 16)
+    
+    Note: The default checkpoint is best_tokenizer.pt, which is used for encoding/extracting latents.
     
     Returns:
         encoder: Loaded MuseTokEncoder instance
@@ -63,7 +65,8 @@ def load_musetok_model(checkpoint_path: Optional[str] = None,
     """
     # Set default paths
     if checkpoint_path is None:
-        checkpoint_path = os.path.join(MUSETOK_CHECKPOINT_DIR, "model.pt")
+        # Default to best_tokenizer checkpoint (used for encoding/extracting latents)
+        checkpoint_path = os.path.join(MUSETOK_CHECKPOINT_DIR, "best_tokenizer.pt")
     
     if vocab_path is None:
         # Default to musetok/data/dictionary.pkl

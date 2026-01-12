@@ -16,15 +16,22 @@ import torch
 # Base storage directory - modify this path as needed
 # This should point to a location with sufficient disk space
 STORAGE_DIR = os.environ.get("VALENCE_AROUSAL_STORAGE_DIR", 
-                             "/path/to/storage/valence_arousal")
+                             "/deepfreeze/pnlong/gigamidi")
 
 # Subdirectories within storage
 CHECKPOINTS_DIR = os.path.join(STORAGE_DIR, "checkpoints")
 EMOPIA_DATA_DIR = os.path.join(STORAGE_DIR, "emopia")
 GIGAMIDI_ANNOTATIONS_DIR = os.path.join(STORAGE_DIR, "gigamidi_annotations")
 
+# EMOPIA dataset paths
+# Edited EMOPIA (jingyue's version): REMI-encoded .pkl files
+EMOPIA_JINGYUE_DIR = "/deepfreeze/user_shares/jingyue/EMOPIA_data"
+# EMOPIA+ (original, full dataset): MIDI files and REMI representations
+EMOPIA_PLUS_DIR = os.path.join(EMOPIA_DATA_DIR, "emopia_plus")
+
 # Specific paths
 MUSETOK_CHECKPOINT_DIR = os.path.join(CHECKPOINTS_DIR, "musetok")
+MUSETOK_TOKENIZER_CHECKPOINT = os.path.join(MUSETOK_CHECKPOINT_DIR, "best_tokenizer.pt")
 TRAINED_MODEL_DIR = os.path.join(CHECKPOINTS_DIR, "trained_models")
 EMOPIA_LATENTS_DIR = os.path.join(EMOPIA_DATA_DIR, "latents")
 EMOPIA_LABELS_DIR = os.path.join(EMOPIA_DATA_DIR, "labels")
@@ -40,16 +47,19 @@ def ensure_dir(path: str) -> None:
 def set_storage_dir(path: str) -> None:
     """Set the storage directory (call before other operations)."""
     global STORAGE_DIR, CHECKPOINTS_DIR, EMOPIA_DATA_DIR, GIGAMIDI_ANNOTATIONS_DIR
-    global MUSETOK_CHECKPOINT_DIR, TRAINED_MODEL_DIR, EMOPIA_LATENTS_DIR, EMOPIA_LABELS_DIR
+    global MUSETOK_CHECKPOINT_DIR, MUSETOK_TOKENIZER_CHECKPOINT
+    global TRAINED_MODEL_DIR, EMOPIA_LATENTS_DIR, EMOPIA_LABELS_DIR, EMOPIA_PLUS_DIR
     
     STORAGE_DIR = path
     CHECKPOINTS_DIR = os.path.join(STORAGE_DIR, "checkpoints")
     EMOPIA_DATA_DIR = os.path.join(STORAGE_DIR, "emopia")
     GIGAMIDI_ANNOTATIONS_DIR = os.path.join(STORAGE_DIR, "gigamidi_annotations")
     MUSETOK_CHECKPOINT_DIR = os.path.join(CHECKPOINTS_DIR, "musetok")
+    MUSETOK_TOKENIZER_CHECKPOINT = os.path.join(MUSETOK_CHECKPOINT_DIR, "best_tokenizer.pt")
     TRAINED_MODEL_DIR = os.path.join(CHECKPOINTS_DIR, "trained_models")
     EMOPIA_LATENTS_DIR = os.path.join(EMOPIA_DATA_DIR, "latents")
     EMOPIA_LABELS_DIR = os.path.join(EMOPIA_DATA_DIR, "labels")
+    EMOPIA_PLUS_DIR = os.path.join(EMOPIA_DATA_DIR, "emopia_plus")
 
 # ================================================== #
 #  File I/O Utilities                               #
