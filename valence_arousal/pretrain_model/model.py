@@ -44,14 +44,14 @@ class ValenceArousalMLP(nn.Module):
             predictions: (batch_size, seq_len, 2) or (batch_size, 2) if pooled
         """
         if len(latents.shape) == 3:
-            # Sequence-level: average over valid positions
-            if mask is not None:
-                mask_expanded = mask.unsqueeze(-1).float()
-                latents = (latents * mask_expanded).sum(dim=1) / mask.sum(dim=1, keepdim=True).float()
-            else:
-                latents = latents.mean(dim=1)
-        
-        output = self.mlp(latents)
+            # Sequence-level: predict per-bar (no pooling)
+            batch_size, seq_len, dim = latents.shape
+            latents_flat = latents.reshape(batch_size * seq_len, dim)
+            output_flat = self.mlp(latents_flat)
+            output = output_flat.reshape(batch_size, seq_len, 2)
+        else:
+            # Already pooled to (batch_size, dim)
+            output = self.mlp(latents)
         
         if self.use_tanh:
             output = self.tanh(output)

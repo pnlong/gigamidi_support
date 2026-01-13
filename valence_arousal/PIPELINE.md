@@ -139,8 +139,7 @@ python pretrain_model/train.py \
     --num_workers 4 \
     --output_dir /deepfreeze/pnlong/gigamidi/checkpoints/trained_models \
     --model_name va_mlp \
-    --use_wandb \
-    --wandb_project valence_arousal \
+    --wandb_project gigamidi-support \
     --early_stopping \
     --early_stopping_tolerance 10
 ```
@@ -148,7 +147,6 @@ python pretrain_model/train.py \
 **Key Arguments**:
 - `--pool`: Add this flag to pool (average) across bars before model (song-level prediction)
 - `--resume`: Resume training from best checkpoint
-- `--use_wandb`: Enable Weights & Biases logging (optional but recommended)
 
 ### 3.2 Evaluate Trained Model
 

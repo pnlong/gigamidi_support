@@ -86,8 +86,15 @@ def evaluate_batch(
         # Pooled: outputs is (batch_size, 2)
         pred_valence = outputs[:, 0]
         pred_arousal = outputs[:, 1]
-        loss_valence = loss_fn(pred_valence, valence_true)
-        loss_arousal = loss_fn(pred_arousal, arousal_true)
+        
+        # Pool targets over valid bars to match pooled predictions
+        mask_float = mask.float()
+        denom = mask_float.sum(dim=1).clamp(min=1e-8)
+        valence_true_pooled = (valence_true * mask_float).sum(dim=1) / denom
+        arousal_true_pooled = (arousal_true * mask_float).sum(dim=1) / denom
+        
+        loss_valence = loss_fn(pred_valence, valence_true_pooled)
+        loss_arousal = loss_fn(pred_arousal, arousal_true_pooled)
         loss = (loss_valence + loss_arousal) / 2
     
     # Backward pass
@@ -95,7 +102,7 @@ def evaluate_batch(
         loss.backward()
         optimizer.step()
     
-    loss_value = float(loss)
+    loss_value = float(loss.detach())
     
     # Compute metrics
     with torch.no_grad():
@@ -199,7 +206,7 @@ def parse_args(args=None, namespace=None):
                        help="Output directory for checkpoints")
     parser.add_argument("--model_name", type=str, default="va_mlp",
                        help="Model name")
-    parser.add_argument("--wandb_project", type=str, default="valence_arousal",
+    parser.add_argument("--wandb_project", type=str, default="gigamidi-support",
                        help="Wandb project name")
     parser.add_argument("--resume", action="store_true",
                        help="Resume from checkpoint")
