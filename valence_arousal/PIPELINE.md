@@ -251,24 +251,27 @@ python analyze_emotion_annotations/print_statistics.py \
 
 ```
 /deepfreeze/pnlong/gigamidi/
-├── checkpoints/
-│   ├── musetok/
-│   │   └── best_tokenizer.pt
-│   └── trained_models/
-│       └── va_mlp/
-│           └── checkpoints/
-│               ├── best_model.pt
-│               └── best_optimizer.pt
-├── emopia/
-│   ├── emopia_plus/          # EMOPIA+ dataset (to be downloaded)
-│   ├── latents/
-│   │   ├── jingyue/          # Latents from edited EMOPIA
-│   │   └── emopia_plus/      # Latents from EMOPIA+
-│   └── labels/
-│       ├── jingyue_va_labels.json
-│       └── emopia_plus_va_labels.json
-└── gigamidi_annotations/
-    └── annotations.csv        # Bar-level VA predictions
+├── musetok/
+│   └── best_tokenizer.pt
+│
+└── emopia_valence_arousal/
+    ├── checkpoints/
+    │   └── trained_models/
+    │       └── va_mlp/
+    │           └── checkpoints/
+    │               ├── best_model.pt
+    │               └── best_optimizer.pt
+    ├── emopia/
+    │   ├── emopia_plus/          # EMOPIA+ dataset (to be downloaded)
+    │   ├── latents/
+    │   │   ├── jingyue/          # Latents from edited EMOPIA
+    │   │   └── emopia_plus/      # Latents from EMOPIA+
+    │   └── labels/
+    │       ├── jingyue_va_labels.json
+    │       └── emopia_plus_va_labels.json
+    ├── gigamidi_annotations/
+    │   └── annotations.csv        # Bar-level VA predictions
+    └── evaluation_results/
 
 External:
 /deepfreeze/user_shares/jingyue/EMOPIA_data/  # Edited EMOPIA (direct path)

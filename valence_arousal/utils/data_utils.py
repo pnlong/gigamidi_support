@@ -34,7 +34,8 @@ EMOPIA_JINGYUE_DIR = "/deepfreeze/user_shares/jingyue/EMOPIA_data"
 EMOPIA_PLUS_DIR = os.path.join(EMOPIA_DATA_DIR, "emopia_plus")
 
 # Specific paths
-MUSETOK_CHECKPOINT_DIR = os.path.join(CHECKPOINTS_DIR, "musetok")
+# MuseTok checkpoint (shared across tasks, at storage root)
+MUSETOK_CHECKPOINT_DIR = os.path.join(STORAGE_DIR, "musetok")
 MUSETOK_TOKENIZER_CHECKPOINT = os.path.join(MUSETOK_CHECKPOINT_DIR, "best_tokenizer.pt")
 TRAINED_MODEL_DIR = os.path.join(CHECKPOINTS_DIR, "trained_models")
 EMOPIA_LATENTS_DIR = os.path.join(EMOPIA_DATA_DIR, "latents")
@@ -61,7 +62,7 @@ def set_storage_dir(path: str) -> None:
     EMOPIA_DATA_DIR = os.path.join(EMOPIA_VALENCE_AROUSAL_DIR, "emopia")
     GIGAMIDI_ANNOTATIONS_DIR = os.path.join(EMOPIA_VALENCE_AROUSAL_DIR, "gigamidi_annotations")
     EVALUATION_RESULTS_DIR = os.path.join(EMOPIA_VALENCE_AROUSAL_DIR, "evaluation_results")
-    MUSETOK_CHECKPOINT_DIR = os.path.join(CHECKPOINTS_DIR, "musetok")
+    MUSETOK_CHECKPOINT_DIR = os.path.join(STORAGE_DIR, "musetok")
     MUSETOK_TOKENIZER_CHECKPOINT = os.path.join(MUSETOK_CHECKPOINT_DIR, "best_tokenizer.pt")
     TRAINED_MODEL_DIR = os.path.join(CHECKPOINTS_DIR, "trained_models")
     EMOPIA_LATENTS_DIR = os.path.join(EMOPIA_DATA_DIR, "latents")
