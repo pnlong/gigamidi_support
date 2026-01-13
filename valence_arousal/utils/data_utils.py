@@ -18,10 +18,14 @@ import torch
 STORAGE_DIR = os.environ.get("VALENCE_AROUSAL_STORAGE_DIR", 
                              "/deepfreeze/pnlong/gigamidi")
 
-# Subdirectories within storage
-CHECKPOINTS_DIR = os.path.join(STORAGE_DIR, "checkpoints")
-EMOPIA_DATA_DIR = os.path.join(STORAGE_DIR, "emopia")
-GIGAMIDI_ANNOTATIONS_DIR = os.path.join(STORAGE_DIR, "gigamidi_annotations")
+# Task-specific base directory
+EMOPIA_VALENCE_AROUSAL_DIR = os.path.join(STORAGE_DIR, "emopia_valence_arousal")
+
+# Subdirectories within task-specific directory
+CHECKPOINTS_DIR = os.path.join(EMOPIA_VALENCE_AROUSAL_DIR, "checkpoints")
+EMOPIA_DATA_DIR = os.path.join(EMOPIA_VALENCE_AROUSAL_DIR, "emopia")
+GIGAMIDI_ANNOTATIONS_DIR = os.path.join(EMOPIA_VALENCE_AROUSAL_DIR, "gigamidi_annotations")
+EVALUATION_RESULTS_DIR = os.path.join(EMOPIA_VALENCE_AROUSAL_DIR, "evaluation_results")
 
 # EMOPIA dataset paths
 # Edited EMOPIA (jingyue's version): REMI-encoded .pkl files
@@ -46,14 +50,17 @@ def ensure_dir(path: str) -> None:
 
 def set_storage_dir(path: str) -> None:
     """Set the storage directory (call before other operations)."""
-    global STORAGE_DIR, CHECKPOINTS_DIR, EMOPIA_DATA_DIR, GIGAMIDI_ANNOTATIONS_DIR
+    global STORAGE_DIR, EMOPIA_VALENCE_AROUSAL_DIR
+    global CHECKPOINTS_DIR, EMOPIA_DATA_DIR, GIGAMIDI_ANNOTATIONS_DIR, EVALUATION_RESULTS_DIR
     global MUSETOK_CHECKPOINT_DIR, MUSETOK_TOKENIZER_CHECKPOINT
     global TRAINED_MODEL_DIR, EMOPIA_LATENTS_DIR, EMOPIA_LABELS_DIR, EMOPIA_PLUS_DIR
     
     STORAGE_DIR = path
-    CHECKPOINTS_DIR = os.path.join(STORAGE_DIR, "checkpoints")
-    EMOPIA_DATA_DIR = os.path.join(STORAGE_DIR, "emopia")
-    GIGAMIDI_ANNOTATIONS_DIR = os.path.join(STORAGE_DIR, "gigamidi_annotations")
+    EMOPIA_VALENCE_AROUSAL_DIR = os.path.join(STORAGE_DIR, "emopia_valence_arousal")
+    CHECKPOINTS_DIR = os.path.join(EMOPIA_VALENCE_AROUSAL_DIR, "checkpoints")
+    EMOPIA_DATA_DIR = os.path.join(EMOPIA_VALENCE_AROUSAL_DIR, "emopia")
+    GIGAMIDI_ANNOTATIONS_DIR = os.path.join(EMOPIA_VALENCE_AROUSAL_DIR, "gigamidi_annotations")
+    EVALUATION_RESULTS_DIR = os.path.join(EMOPIA_VALENCE_AROUSAL_DIR, "evaluation_results")
     MUSETOK_CHECKPOINT_DIR = os.path.join(CHECKPOINTS_DIR, "musetok")
     MUSETOK_TOKENIZER_CHECKPOINT = os.path.join(MUSETOK_CHECKPOINT_DIR, "best_tokenizer.pt")
     TRAINED_MODEL_DIR = os.path.join(CHECKPOINTS_DIR, "trained_models")
