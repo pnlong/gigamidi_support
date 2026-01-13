@@ -48,8 +48,8 @@ def parse_args():
                        help="Max sequence length")
     parser.add_argument("--pool", action="store_true",
                        help="Pool across bars")
-    parser.add_argument("--device", type=str, default="cuda",
-                       help="Device")
+    parser.add_argument("--gpu", action="store_true",
+                       help="Use GPU (CUDA); if not provided, use CPU")
     parser.add_argument("--num_workers", type=int, default=4,
                        help="Number of workers")
     parser.add_argument("--output_dir", type=str, default="./evaluation_results",
@@ -62,7 +62,7 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    device = torch.device(args.device if torch.cuda.is_available() and args.device == "cuda" else "cpu")
+    device = torch.device("cuda" if args.gpu and torch.cuda.is_available() else "cpu")
     
     ensure_dir(args.output_dir)
     

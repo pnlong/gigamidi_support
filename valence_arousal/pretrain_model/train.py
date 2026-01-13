@@ -191,8 +191,8 @@ def parse_args(args=None, namespace=None):
                        help="Early stopping patience")
     
     # Others
-    parser.add_argument("--device", type=str, default="cuda",
-                       help="Device (cuda/cpu)")
+    parser.add_argument("--gpu", action="store_true",
+                       help="Use GPU (CUDA); if not provided, use CPU")
     parser.add_argument("--num_workers", type=int, default=int(cpu_count() / 4),
                        help="Number of data loader workers")
     parser.add_argument("--output_dir", type=str, default=TRAINED_MODEL_DIR,
@@ -224,7 +224,7 @@ if __name__ == "__main__":
     args = parse_args()
     
     # Device
-    device = torch.device(args.device if torch.cuda.is_available() and args.device == "cuda" else "cpu")
+    device = torch.device("cuda" if args.gpu and torch.cuda.is_available() else "cpu")
     logging.info(f"Using device: {device}")
     
     # Load file lists (assuming they exist in latents_dir/{split}/)

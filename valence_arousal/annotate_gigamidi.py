@@ -43,8 +43,8 @@ def parse_args():
                        help="Use tanh activation")
     parser.add_argument("--dropout", type=float, default=0.1,
                        help="Dropout rate")
-    parser.add_argument("--device", type=str, default="cuda",
-                       help="Device")
+    parser.add_argument("--gpu", action="store_true",
+                       help="Use GPU (CUDA); if not provided, use CPU")
     parser.add_argument("--streaming", action="store_true", default=True,
                        help="Use streaming mode")
     parser.add_argument("--split", type=str, default="train",
@@ -55,6 +55,8 @@ def parse_args():
                        help="Output CSV file path (defaults to <STORAGE_DIR>/gigamidi_annotations/annotations.csv)")
     parser.add_argument("--resume", action="store_true", default=False,
                        help="Resume from existing CSV file (skip already-processed songs)")
+    parser.add_argument("--velocity", action="store_true", default=False,
+                       help="Prefer velocity vocabulary for MuseTok (will fallback with warning if checkpoint doesn't support it)")
     
     args = parser.parse_args()
     if args.hidden_dim is None:
@@ -104,7 +106,7 @@ def process_song(sample, model, musetok_model, vocab, device):
         
         # Extract latents on-the-fly
         latents, bar_positions = extract_latents_from_midi(
-            midi_bytes, musetok_model, vocab, device
+            midi_bytes, musetok_model, vocab, has_velocity=use_velocity
         )
         
         if len(latents) == 0:
@@ -145,7 +147,7 @@ def process_song(sample, model, musetok_model, vocab, device):
 
 if __name__ == "__main__":
     args = parse_args()
-    device = torch.device(args.device if torch.cuda.is_available() and args.device == "cuda" else "cpu")
+    device = torch.device("cuda" if args.gpu and torch.cuda.is_available() else "cpu")
     
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     logging.info(f"Using device: {device}")
@@ -180,11 +182,13 @@ if __name__ == "__main__":
     
     # Load MuseTok model
     logging.info("Loading MuseTok model...")
-    musetok_model, vocab = load_musetok_model(
+    musetok_model, vocab, use_velocity = load_musetok_model(
         checkpoint_path=args.checkpoint_path,
         vocab_path=args.vocab_path,
-        device=str(device),
+        use_gpu=args.gpu,
+        prefer_velocity=args.velocity,
     )
+    logging.info(f"Model loaded successfully (velocity support: {use_velocity})")
     
     # Load GigaMIDI dataset
     logging.info(f"Loading GigaMIDI dataset (split={args.split}, streaming={args.streaming})...")
@@ -204,41 +208,40 @@ if __name__ == "__main__":
     else:
         iterator = tqdm(iterator, desc="Processing")
     
-    try:
-        for sample in iterator:
-            if args.max_samples and count >= args.max_samples:
-                break
+    for sample in iterator:
+        if args.max_samples and count >= args.max_samples:
+            break
+        
+        md5 = sample.get("md5", "")
+        if not md5:
+            errors += 1
+            continue
+        
+        # Process song (returns list of bar-level predictions)
+        results = process_song(sample, va_model, musetok_model, vocab, device)
+        
+        if results is not None and len(results) > 0:
+            # Filter out already-processed bars if resuming
+            bars_to_write = []
+            for result in results:
+                bar_key = (result["md5"], result["bar_number"])
+                if bar_key not in processed:
+                    bars_to_write.append(result)
+                    processed.add(bar_key)
             
-            md5 = sample.get("md5", "")
-            if not md5:
-                errors += 1
-                continue
-            
-            # Process song (returns list of bar-level predictions)
-            results = process_song(sample, va_model, musetok_model, vocab, device)
-            
-            if results is not None and len(results) > 0:
-                # Filter out already-processed bars if resuming
-                bars_to_write = []
-                for result in results:
-                    bar_key = (result["md5"], result["bar_number"])
-                    if bar_key not in processed:
-                        bars_to_write.append(result)
-                        processed.add(bar_key)
-                
-                if bars_to_write:
-                    # Write all bars for this song to CSV
-                    df_rows = pd.DataFrame(bars_to_write)
-                    df_rows.to_csv(args.output_path, mode='a', header=False, index=False)
-                    count += len(bars_to_write)
-                else:
-                    skipped += 1
-                
-                # Log progress periodically
-                if count % 1000 == 0:  # Changed to 1000 since we're counting bars now
-                    logging.info(f"Processed {count} bars (skipped songs: {skipped}, errors: {errors})")
+            if bars_to_write:
+                # Write all bars for this song to CSV
+                df_rows = pd.DataFrame(bars_to_write)
+                df_rows.to_csv(args.output_path, mode='a', header=False, index=False)
+                count += len(bars_to_write)
             else:
-                errors += 1
+                skipped += 1
+            
+            # Log progress periodically
+            if count % 1000 == 0:  # Changed to 1000 since we're counting bars now
+                logging.info(f"Processed {count} bars (skipped songs: {skipped}, errors: {errors})")
+        else:
+            errors += 1
     
     logging.info(f"\nProcessing complete!")
     logging.info(f"Successfully processed: {count} bars")

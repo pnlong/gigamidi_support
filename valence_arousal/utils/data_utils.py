@@ -88,18 +88,56 @@ def load_pickle(filepath: str) -> any:
         return pickle.load(f)
 
 def save_latents(filepath: str, latents: np.ndarray, metadata: Optional[dict] = None) -> None:
-    """Save latents as safetensors file with optional metadata."""
+    """Save latents as safetensors file with optional metadata.
+    
+    Note: Safetensors metadata requires all values to be strings.
+    Complex values (lists, dicts) are JSON-encoded.
+    """
     ensure_dir(os.path.dirname(filepath))
     tensors = {"latents": torch.from_numpy(latents.astype(np.float32))}
     if metadata:
-        # Store metadata as JSON string in safetensors metadata
-        save_file(tensors, filepath, metadata=metadata)
+        # Convert metadata to string format (safetensors requires all values to be strings)
+        metadata_str = {}
+        for key, value in metadata.items():
+            if isinstance(value, (list, dict)):
+                # JSON-encode complex types
+                metadata_str[key] = json.dumps(value)
+            elif isinstance(value, (int, float)):
+                # Convert numbers to strings
+                metadata_str[key] = str(value)
+            else:
+                # Already a string or can be converted
+                metadata_str[key] = str(value)
+        save_file(tensors, filepath, metadata=metadata_str)
     else:
         save_file(tensors, filepath)
 
 def load_latents(filepath: str) -> tuple[np.ndarray, Optional[dict]]:
-    """Load latents from safetensors file."""
+    """Load latents from safetensors file.
+    
+    Note: Metadata values are decoded from JSON strings back to their original types.
+    """
     with safe_open(filepath, framework="pt", device="cpu") as f:
         latents = f.get_tensor("latents").numpy()
-        metadata = f.metadata() if f.metadata() else None
+        metadata_raw = f.metadata() if f.metadata() else None
+        
+        # Decode metadata from strings back to original types
+        if metadata_raw:
+            metadata = {}
+            for key, value in metadata_raw.items():
+                # Try to decode JSON strings, otherwise keep as string
+                try:
+                    metadata[key] = json.loads(value)
+                except (json.JSONDecodeError, TypeError):
+                    # Not JSON, try to convert to int/float if possible
+                    try:
+                        if '.' in value:
+                            metadata[key] = float(value)
+                        else:
+                            metadata[key] = int(value)
+                    except ValueError:
+                        metadata[key] = value
+        else:
+            metadata = None
+            
     return latents, metadata

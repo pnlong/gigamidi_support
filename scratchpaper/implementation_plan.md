@@ -616,7 +616,7 @@ def preprocess_emopia(emopia_dir: str,
                      output_dir: str,
                      checkpoint_path: str,
                      vocab_path: str,
-                     device: str = 'cuda',
+                     use_gpu: bool = False,
                      num_workers: int = 4,
                      resume: bool = False,
                      use_remi_dir: bool = False,
@@ -629,25 +629,26 @@ def preprocess_emopia(emopia_dir: str,
         output_dir: Output directory for latents
         checkpoint_path: Path to MuseTok checkpoint
         vocab_path: Path to vocabulary file
-        device: Device to use
+        use_gpu: If True, use CUDA; otherwise use CPU
         num_workers: Number of parallel workers
         resume: If True, skip files that have already been processed
         use_remi_dir: If True and EMOPIA+ structure, use REMI/ subdirectory
         split: If provided, process only this split (train/valid/test) for EMOPIA+
     """
     # Implementation:
-    # 1. Load MuseTok model (once, before multiprocessing)
-    # 2. Find all files (.pkl and .mid/.midi) in emopia_dir
+    # 1. Convert use_gpu to device string: device = "cuda" if use_gpu and torch.cuda.is_available() else "cpu"
+    # 2. Load MuseTok model (once, before multiprocessing)
+    # 3. Find all files (.pkl and .mid/.midi) in emopia_dir
     #    - If split is provided, look in emopia_dir/split/ or emopia_dir/REMI/split/
-    # 3. If resume=True:
+    # 4. If resume=True:
     #    - Call get_processed_files() to get set of already-processed filenames
     #    - Filter out files whose output already exists
     #    - Log how many files are being skipped
-    # 4. Create output directories (preserve split structure if EMOPIA+)
-    # 5. Prepare arguments for multiprocessing (each worker needs model, vocab, device)
+    # 5. Create output directories (preserve split structure if EMOPIA+)
+    # 6. Prepare arguments for multiprocessing (each worker needs model, vocab, device)
     #    Note: Model loading in multiprocessing may need special handling (e.g., load per worker)
-    # 6. Process files in parallel using Pool
-    # 7. Collect results and log statistics (successful, failed, skipped)
+    # 7. Process files in parallel using Pool
+    # 8. Collect results and log statistics (successful, failed, skipped)
     #    - Log counts for .pkl vs .mid/.midi files separately
     pass
 
@@ -658,7 +659,8 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", default=EMOPIA_LATENTS_DIR)
     parser.add_argument("--checkpoint_path", default=None)
     parser.add_argument("--vocab_path", default=None)
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--gpu", action="store_true",
+                       help="Use GPU (CUDA); if not provided, use CPU")
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--resume", action="store_true", default=False,
                        help="Resume preprocessing: skip files that have already been processed")
@@ -671,7 +673,7 @@ if __name__ == "__main__":
     
     preprocess_emopia(
         args.emopia_dir, args.output_dir, args.checkpoint_path,
-        args.vocab_path, args.device, args.num_workers, args.resume,
+        args.vocab_path, args.gpu, args.num_workers, args.resume,
         args.use_remi_dir, args.split
     )
 ```
@@ -1294,8 +1296,8 @@ def parse_args(args=None, namespace=None):
                        help="Early stopping patience")
     
     # Others
-    parser.add_argument("--device", type=str, default="cuda",
-                       help="Device (cuda/cpu)")
+    parser.add_argument("--gpu", action="store_true",
+                       help="Use GPU (CUDA); if not provided, use CPU")
     parser.add_argument("--num_workers", type=int, default=int(cpu_count() / 4),
                        help="Number of data loader workers")
     parser.add_argument("--output_dir", type=str, default=TRAINED_MODEL_DIR,
@@ -1329,7 +1331,7 @@ if __name__ == "__main__":
     args = parse_args()
     
     # Device
-    device = torch.device(args.device if torch.cuda.is_available() and args.device == "cuda" else "cpu")
+    device = torch.device("cuda" if args.gpu and torch.cuda.is_available() else "cpu")
     logging.info(f"Using device: {device}")
     
     # Load file lists (assuming they exist in latents_dir/{split}/)
@@ -1606,8 +1608,8 @@ def parse_args():
                        help="Max sequence length")
     parser.add_argument("--pool", action="store_true",
                        help="Pool across bars")
-    parser.add_argument("--device", type=str, default="cuda",
-                       help="Device")
+    parser.add_argument("--gpu", action="store_true",
+                       help="Use GPU (CUDA); if not provided, use CPU")
     parser.add_argument("--num_workers", type=int, default=4,
                        help="Number of workers")
     parser.add_argument("--output_dir", type=str, default="./evaluation_results",
@@ -1620,7 +1622,7 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    device = torch.device(args.device if torch.cuda.is_available() and args.device == "cuda" else "cpu")
+    device = torch.device("cuda" if args.gpu and torch.cuda.is_available() else "cpu")
     
     ensure_dir(args.output_dir)
     
@@ -1801,8 +1803,8 @@ def parse_args():
                        help="Use tanh activation")
     parser.add_argument("--dropout", type=float, default=0.1,
                        help="Dropout rate")
-    parser.add_argument("--device", type=str, default="cuda",
-                       help="Device")
+    parser.add_argument("--gpu", action="store_true",
+                       help="Use GPU (CUDA); if not provided, use CPU")
     parser.add_argument("--streaming", action="store_true", default=True,
                        help="Use streaming mode")
     parser.add_argument("--split", type=str, default="train",
@@ -1903,7 +1905,7 @@ def process_song(sample, model, musetok_model, vocab, device):
 
 if __name__ == "__main__":
     args = parse_args()
-    device = torch.device(args.device if torch.cuda.is_available() and args.device == "cuda" else "cpu")
+    device = torch.device("cuda" if args.gpu and torch.cuda.is_available() else "cpu")
     
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     logging.info(f"Using device: {device}")

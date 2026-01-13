@@ -52,8 +52,8 @@ Then extract the zip file and place `best_tokenizer/model.pt` directly in `check
 python pretrain_model/preprocess_emopia.py \
     --emopia_dir /deepfreeze/user_shares/jingyue/EMOPIA_data \
     --output_dir /deepfreeze/pnlong/gigamidi/emopia/latents/jingyue \
-    --device cuda \
-    --num_workers 4 \
+    --gpu \
+    --batch_size 8 \
     --resume
 ```
 
@@ -65,8 +65,8 @@ python pretrain_model/preprocess_emopia.py \
     --output_dir /deepfreeze/pnlong/gigamidi/emopia/latents/emopia_plus \
     --use_remi_dir \
     --split train \
-    --device cuda \
-    --num_workers 4 \
+    --gpu \
+    --batch_size 8 \
     --resume
 ```
 
@@ -77,14 +77,16 @@ python pretrain_model/preprocess_emopia.py \
     --emopia_dir /deepfreeze/pnlong/gigamidi/emopia/emopia_plus \
     --output_dir /deepfreeze/pnlong/gigamidi/emopia/latents/emopia_plus \
     --split train \
-    --device cuda \
-    --num_workers 4 \
+    --gpu \
+    --batch_size 8 \
     --resume
 ```
 
 **Note**: 
 - Use `--resume` to skip already-processed files
-- For EMOPIA+ with splits, process each split separately: `--split train`, `--split valid`, `--split test`
+- For EMOPIA+ with splits: 
+  - If `--split` is not provided, all splits (train/valid/test) will be processed automatically
+  - To process a specific split only: `--split train`, `--split valid`, or `--split test`
 - Output structure will mirror input structure (preserves train/valid/test splits)
 
 ### 2.2 Prepare Continuous VA Labels
@@ -135,7 +137,7 @@ python pretrain_model/train.py \
     --epochs 100 \
     --max_seq_len 42 \
     --loss_type smooth_l1 \
-    --device cuda \
+    --gpu \
     --num_workers 4 \
     --output_dir /deepfreeze/pnlong/gigamidi/checkpoints/trained_models \
     --model_name va_mlp \
@@ -162,7 +164,7 @@ python pretrain_model/evaluate.py \
     --hidden_dim 64 \
     --batch_size 32 \
     --max_seq_len 42 \
-    --device cuda \
+    --gpu \
     --num_workers 4 \
     --output_dir /deepfreeze/pnlong/gigamidi/evaluation_results
 ```
@@ -182,7 +184,7 @@ python annotate_gigamidi.py \
     --model_path /deepfreeze/pnlong/gigamidi/checkpoints/trained_models/va_mlp/checkpoints/best_model.pt \
     --input_dim 128 \
     --hidden_dim 64 \
-    --device cuda \
+    --gpu \
     --streaming \
     --split train \
     --output_path /deepfreeze/pnlong/gigamidi/gigamidi_annotations/annotations.csv \
@@ -371,14 +373,16 @@ python annotate_gigamidi.py \
 1. **Resume Processing**: Always use `--resume` flag to skip already-processed files
 2. **Testing**: Use `--max_samples N` in `annotate_gigamidi.py` to test on a small subset first
 3. **Monitoring**: Use `--use_wandb` during training to track metrics in real-time
-4. **Device**: Use `--device cpu` if CUDA is not available
-5. **Parallel Processing**: Adjust `--num_workers` based on your system (default: 4)
+4. **Device**: Omit `--gpu` flag to use CPU instead of GPU
+5. **Batch Processing**: `--batch_size` in `preprocess_emopia.py` is currently unused (processes sequentially)
+6. **DataLoader Workers**: `--num_workers` in `train.py` and `evaluate.py` is safe to use with CUDA (uses DataLoader, not multiprocessing Pool)
 
 ---
 
 ## Troubleshooting
 
-- **Out of Memory**: Reduce `--batch_size` or `--num_workers`
+- **Out of Memory**: Reduce `--batch_size` in training/evaluation scripts
+- **CUDA Multiprocessing Error**: `preprocess_emopia.py` no longer uses multiprocessing (processes sequentially) to avoid CUDA re-initialization issues
 - **Checkpoint Not Found**: Verify MuseTok checkpoint is at `checkpoints/musetok/best_tokenizer.pt`
 - **File Not Found**: Check that EMOPIA directories exist and paths are correct
 - **Symlink Errors**: Use direct paths instead of symlinks (see `data_utils.py` for EMOPIA_JINGYUE_DIR)

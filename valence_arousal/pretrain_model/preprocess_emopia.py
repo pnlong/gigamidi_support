@@ -50,9 +50,9 @@ import argparse
 import logging
 from pathlib import Path
 from tqdm import tqdm
-from multiprocessing import Pool
 import sys
 import glob
+import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
@@ -86,49 +86,83 @@ def load_remi_from_pickle(pkl_path: str):
     data = load_pickle(pkl_path)
     
     # Handle different pickle formats:
+    # - Tuple format (jingyue's format): (bar_positions, events) where:
+    #   * bar_positions: list of indices where 'Bar' events occur in events list
+    #   * events: list of dicts with 'name' and 'value' keys (REMI events)
     # - Could be just events list
     # - Could be dict with 'events' key
     # - Could be dict with 'events' and 'bar_positions' keys
-    if isinstance(data, list):
+    if isinstance(data, tuple) and len(data) >= 2:
+        # Jingyue's format: (bar_positions, events)
+        # bar_positions is a list of indices into events where 'Bar' events occur
+        # events is a list of event dicts with 'name' and 'value' keys
+        bar_positions_indices = data[0]  # List of indices where bars occur
+        events = data[1]  # List of event dicts
+        
+        if not isinstance(bar_positions_indices, list):
+            raise ValueError(f"Unexpected pickle format in {pkl_path}: tuple[0] (bar_positions) is type {type(bar_positions_indices)}")
+        if not isinstance(events, list):
+            raise ValueError(f"Unexpected pickle format in {pkl_path}: tuple[1] (events) is type {type(events)}")
+        if len(events) == 0:
+            raise ValueError(f"Empty events list in {pkl_path}")
+        
+        # Convert bar_positions from indices to actual bar positions
+        # bar_positions_indices are the indices in events where 'Bar' events occur
+        # We need to verify these are correct and use them directly
+        bar_positions = bar_positions_indices.copy()
+        
+        # Verify that bar_positions indices actually point to 'Bar' events
+        for idx in bar_positions[:5]:  # Check first 5 as sample
+            if idx < len(events) and events[idx].get('name') != 'Bar':
+                logging.warning(f"Bar position index {idx} in {pkl_path} does not point to 'Bar' event (found: {events[idx].get('name')})")
+        
+    elif isinstance(data, list):
+        # Just events list - extract bar positions from events
         events = data
         bar_positions = get_bar_positions(events)
     elif isinstance(data, dict):
-        events = data.get('events', data.get('remi', data))
+        # Try various possible keys
+        events = data.get('events') or data.get('remi') or data.get('event_seq') or data.get('remi_events')
+        if events is None:
+            # If no standard key found, check if dict values are lists
+            list_values = [v for v in data.values() if isinstance(v, list) and len(v) > 0]
+            if list_values:
+                events = list_values[0]  # Use first list value
+            else:
+                raise ValueError(f"Unexpected pickle format in {pkl_path}: dict keys are {list(data.keys())}")
         if not isinstance(events, list):
-            raise ValueError(f"Unexpected pickle format in {pkl_path}")
-        bar_positions = data.get('bar_positions', get_bar_positions(events))
+            raise ValueError(f"Unexpected pickle format in {pkl_path}: events is type {type(events)}")
+        bar_positions = data.get('bar_positions') or data.get('bar_pos') or data.get('pos')
+        if bar_positions is None:
+            bar_positions = get_bar_positions(events)
     else:
-        raise ValueError(f"Unexpected pickle format in {pkl_path}")
+        raise ValueError(f"Unexpected pickle format in {pkl_path}: data is type {type(data)}")
     
     return events, bar_positions
 
-def process_single_file_worker(args_tuple):
+def process_single_file(file_path: str,
+                      output_path: str,
+                      musetok_model,
+                      vocab: dict,
+                      filter_velocity: bool = False):
     """
-    Process a single file (MIDI or REMI pickle) for multiprocessing.
-    
-    This function is called by each worker process. It loads the model
-    independently to avoid CUDA/device conflicts in multiprocessing.
+    Process a single file (MIDI or REMI pickle).
     
     Supports:
     - .pkl files: Load REMI events directly, extract latents
     - .mid/.midi files: Load MIDI, convert to REMI, extract latents
     
     Args:
-        args_tuple: (file_path, output_path, checkpoint_path, vocab_path, device)
+        file_path: Path to input file
+        output_path: Path to output .safetensors file
+        musetok_model: Pre-loaded MuseTokEncoder instance
+        vocab: Vocabulary dictionary
+        filter_velocity: If True, filter out Note_Velocity events before processing
     
     Returns:
         (filename, success, error_message)
     """
-    file_path, output_path, checkpoint_path, vocab_path, device = args_tuple
-    
     try:
-        # Load model in this worker process (each worker needs its own model instance)
-        musetok_model, vocab = load_musetok_model(
-            checkpoint_path=checkpoint_path,
-            vocab_path=vocab_path,
-            device=device,
-        )
-        
         filename = Path(file_path).stem
         
         # Check file type and process accordingly
@@ -137,8 +171,9 @@ def process_single_file_worker(args_tuple):
             events, bar_positions = load_remi_from_pickle(file_path)
             
             # Extract latents from REMI events
+            # If vocabulary doesn't support velocity, filter velocity events
             latents = extract_latents_from_events(
-                events, bar_positions, musetok_model, vocab, device
+                events, bar_positions, musetok_model, vocab, filter_velocity=filter_velocity
             )
             
             file_type = "remi_pkl"
@@ -147,8 +182,10 @@ def process_single_file_worker(args_tuple):
             # Full pipeline: MIDI → REMI → latents
             # Note: For EMOPIA MIDI files, merge Melody + Texture + Bass tracks
             # (exclude Chord track) when loading MIDI
+            # extract_latents_from_midi has has_velocity parameter, but we use filter_velocity logic
+            # If filter_velocity is True, we don't want velocity in the MIDI conversion either
             latents, bar_positions = extract_latents_from_midi(
-                file_path, musetok_model, vocab, device
+                file_path, musetok_model, vocab, has_velocity=not filter_velocity
             )
             
             file_type = "midi"
@@ -198,7 +235,8 @@ def find_emopia_files(emopia_dir: str, use_remi_dir: bool = False, split: str = 
     Args:
         emopia_dir: Base EMOPIA directory
         use_remi_dir: If True and EMOPIA+ structure, look in REMI/ subdirectory
-        split: If provided, process only this split (train/valid/test) for EMOPIA+
+        split: If provided, process only this split (train/valid/test) for EMOPIA+.
+               If None and EMOPIA+ structure detected, processes all splits automatically.
     
     Returns:
         list of (file_path, relative_path) tuples
@@ -221,21 +259,50 @@ def find_emopia_files(emopia_dir: str, use_remi_dir: bool = False, split: str = 
         # Edited EMOPIA or flat structure: use base directory
         search_dir = emopia_path
     
-    # If split is provided, look in split subdirectory
+    # If split is provided, look in split subdirectory only
+    # If split is None, process all splits (for EMOPIA+ structure)
     if split:
         search_dir = search_dir / split
-    
-    # Find all .pkl and .mid/.midi files recursively
-    for ext in ['*.pkl', '*.mid', '*.midi', '*.MID', '*.MIDI']:
-        for file_path in search_dir.rglob(ext):
-            if is_remi_file(str(file_path)) or is_midi_file(str(file_path)):
-                # Get relative path from emopia_dir to preserve structure
-                try:
-                    relative_path = file_path.relative_to(emopia_path)
-                    files.append((str(file_path), str(relative_path)))
-                except ValueError:
-                    # If relative path fails, just use filename
-                    files.append((str(file_path), file_path.name))
+        # Find all .pkl and .mid/.midi files in this split
+        for ext in ['*.pkl', '*.mid', '*.midi', '*.MID', '*.MIDI']:
+            for file_path in search_dir.rglob(ext):
+                if is_remi_file(str(file_path)) or is_midi_file(str(file_path)):
+                    # Get relative path from emopia_dir to preserve structure
+                    try:
+                        relative_path = file_path.relative_to(emopia_path)
+                        files.append((str(file_path), str(relative_path)))
+                    except ValueError:
+                        # If relative path fails, just use filename
+                        files.append((str(file_path), file_path.name))
+    else:
+        # No split specified: process all splits (train/valid/test) if they exist
+        # Check if EMOPIA+ split structure exists
+        split_dirs = [search_dir / s for s in ['train', 'valid', 'test']]
+        has_splits = any(d.exists() and d.is_dir() for d in split_dirs)
+        
+        if has_splits:
+            # EMOPIA+ structure: process each split
+            for split_name in ['train', 'valid', 'test']:
+                split_dir = search_dir / split_name
+                if split_dir.exists() and split_dir.is_dir():
+                    for ext in ['*.pkl', '*.mid', '*.midi', '*.MID', '*.MIDI']:
+                        for file_path in split_dir.rglob(ext):
+                            if is_remi_file(str(file_path)) or is_midi_file(str(file_path)):
+                                try:
+                                    relative_path = file_path.relative_to(emopia_path)
+                                    files.append((str(file_path), str(relative_path)))
+                                except ValueError:
+                                    files.append((str(file_path), file_path.name))
+        else:
+            # No split structure: process all files recursively from base directory
+            for ext in ['*.pkl', '*.mid', '*.midi', '*.MID', '*.MIDI']:
+                for file_path in search_dir.rglob(ext):
+                    if is_remi_file(str(file_path)) or is_midi_file(str(file_path)):
+                        try:
+                            relative_path = file_path.relative_to(emopia_path)
+                            files.append((str(file_path), str(relative_path)))
+                        except ValueError:
+                            files.append((str(file_path), file_path.name))
     
     return files
 
@@ -244,11 +311,12 @@ def preprocess_emopia(emopia_dir: str,
                      output_dir: str,
                      checkpoint_path: str,
                      vocab_path: str,
-                     device: str = 'cuda',
-                     num_workers: int = 4,
+                     use_gpu: bool = False,
+                     batch_size: int = 1,
                      resume: bool = False,
                      use_remi_dir: bool = False,
-                     split: str = None):
+                     split: str = None,
+                     prefer_velocity: bool = False):
     """
     Preprocess EMOPIA dataset (supports both edited EMOPIA and EMOPIA+).
     
@@ -257,13 +325,20 @@ def preprocess_emopia(emopia_dir: str,
         output_dir: Output directory for latents
         checkpoint_path: Path to MuseTok checkpoint
         vocab_path: Path to vocabulary file
-        device: Device to use ('cuda' or 'cpu')
-        num_workers: Number of parallel workers
+        use_gpu: If True, use CUDA; otherwise use CPU
+        batch_size: Number of files to process before saving (currently unused, processes sequentially)
         resume: If True, skip files that have already been processed
         use_remi_dir: If True and EMOPIA+ structure, use REMI/ subdirectory
         split: If provided, process only this split (train/valid/test) for EMOPIA+
+        prefer_velocity: If True, prefer velocity vocabulary (will fallback with warning if not available)
     """
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    
+    # Log device info
+    if use_gpu and torch.cuda.is_available():
+        logging.info(f"Using device: cuda")
+    else:
+        logging.info(f"Using device: cpu")
     
     # 1. Find all files (.pkl and .mid/.midi)
     logging.info(f"Scanning for EMOPIA files in {emopia_dir}...")
@@ -298,44 +373,40 @@ def preprocess_emopia(emopia_dir: str,
         logging.info("All files already processed. Nothing to do.")
         return
     
-    # 3. Prepare arguments for multiprocessing
-    # Each worker will load its own model instance
-    process_args = []
-    for file_path, relative_path in files_to_process:
-        # Preserve directory structure in output
-        output_path = os.path.join(output_dir, str(Path(relative_path).with_suffix('.safetensors')))
-        process_args.append((file_path, output_path, checkpoint_path, vocab_path, device))
+    # 3. Load model once (shared across all files)
+    logging.info("Loading MuseTok model...")
+    musetok_model, vocab, use_velocity = load_musetok_model(
+        checkpoint_path=checkpoint_path,
+        vocab_path=vocab_path,
+        use_gpu=use_gpu,
+        prefer_velocity=prefer_velocity,
+    )
+    logging.info(f"Model loaded successfully (velocity support: {use_velocity})")
     
-    # 4. Process files in parallel
-    logging.info(f"Processing {len(files_to_process)} files with {num_workers} workers...")
+    # Determine if we need to filter velocity events
+    filter_velocity = not use_velocity
+    if filter_velocity:
+        logging.info("Vocabulary does not include velocity - velocity events will be filtered")
+    
+    # 4. Process files sequentially
+    logging.info(f"Processing {len(files_to_process)} files sequentially...")
     successful = 0
     failed = 0
     errors = []
     
-    if num_workers == 1:
-        # Single-threaded processing (useful for debugging)
-        for args in tqdm(process_args, desc="Processing"):
-            filename, success, error = process_single_file_worker(args)
-            if success:
-                successful += 1
-            else:
-                failed += 1
-                errors.append((filename, error))
-    else:
-        # Multiprocessing
-        with Pool(processes=num_workers) as pool:
-            results = list(tqdm(
-                pool.imap(process_single_file_worker, process_args),
-                total=len(process_args),
-                desc="Processing"
-            ))
+    for file_path, relative_path in tqdm(files_to_process, desc="Processing"):
+        # Preserve directory structure in output
+        output_path = os.path.join(output_dir, str(Path(relative_path).with_suffix('.safetensors')))
         
-        for filename, success, error in results:
-            if success:
-                successful += 1
-            else:
-                failed += 1
-                errors.append((filename, error))
+        filename, success, error = process_single_file(
+            file_path, output_path, musetok_model, vocab, filter_velocity
+        )
+        
+        if success:
+            successful += 1
+        else:
+            failed += 1
+            errors.append((filename, error))
     
     # 5. Log statistics
     logging.info("\n" + "="*60)
@@ -349,7 +420,7 @@ def preprocess_emopia(emopia_dir: str,
             logging.warning(f"  {filename}: {error}")
         if len(errors) > 10:
             logging.warning(f"  ... and {len(errors) - 10} more errors")
-    logging.info("="*60)
+    logging.info("\n" + "="*60)
 
 
 if __name__ == "__main__":
@@ -364,11 +435,10 @@ if __name__ == "__main__":
                        help="Path to MuseTok checkpoint (defaults to MUSETOK_CHECKPOINT_DIR/best_tokenizer.pt)")
     parser.add_argument("--vocab_path", type=str, default=None,
                        help="Path to MuseTok vocabulary (defaults to musetok/data/dictionary.pkl)")
-    parser.add_argument("--device", type=str, default="cuda",
-                       choices=["cuda", "cpu"],
-                       help="Device to use")
-    parser.add_argument("--num_workers", type=int, default=4,
-                       help="Number of parallel workers")
+    parser.add_argument("--gpu", action="store_true",
+                       help="Use GPU (CUDA); if not provided, use CPU")
+    parser.add_argument("--batch_size", type=int, default=1,
+                       help="Batch size for processing (currently unused, processes sequentially)")
     parser.add_argument("--resume", action="store_true", default=False,
                        help="Resume preprocessing: skip files that have already been processed")
     parser.add_argument("--use_remi_dir", action="store_true", default=False,
@@ -376,6 +446,8 @@ if __name__ == "__main__":
     parser.add_argument("--split", type=str, default=None,
                        choices=["train", "valid", "test"],
                        help="For EMOPIA+: process only this split")
+    parser.add_argument("--velocity", action="store_true", default=False,
+                       help="Prefer velocity vocabulary for MuseTok (will fallback with warning if checkpoint doesn't support it)")
     
     args = parser.parse_args()
     
@@ -392,9 +464,10 @@ if __name__ == "__main__":
         args.output_dir,
         checkpoint_path,
         args.vocab_path,
-        args.device,
-        args.num_workers,
+        args.gpu,
+        args.batch_size,
         args.resume,
         args.use_remi_dir,
-        args.split
+        args.split,
+        args.velocity
     )
