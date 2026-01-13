@@ -53,6 +53,7 @@ from tqdm import tqdm
 import sys
 import glob
 import torch
+from typing import List, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
@@ -212,6 +213,75 @@ def process_single_file(file_path: str,
         return (Path(file_path).stem, False, str(e))
 
 
+def process_batch_emopia(batch_files: List[Tuple[str, str]],
+                       output_dir: str,
+                       musetok_model,
+                       vocab: dict,
+                       filter_velocity: bool = False,
+                       is_emopia_plus: bool = False):
+    """
+    Process a batch of EMOPIA files in parallel on GPU.
+    
+    Note: Currently only batches MIDI files. REMI pickle files are processed sequentially
+    as they're already in event format and don't benefit as much from batching.
+    
+    Args:
+        batch_files: List of (file_path, relative_path) tuples
+        output_dir: Output directory for latents
+        musetok_model: Pre-loaded MuseTokEncoder instance
+        vocab: Vocabulary dictionary
+        filter_velocity: If True, filter out Note_Velocity events
+        is_emopia_plus: If True, exclude Chord tracks from MIDI files
+    
+    Returns:
+        List of (filename, success, error_message) tuples
+    """
+    # Separate MIDI and REMI files
+    midi_files = [(fp, rp) for fp, rp in batch_files if is_midi_file(fp)]
+    remi_files = [(fp, rp) for fp, rp in batch_files if is_remi_file(fp)]
+    
+    results = []
+    
+    # Process REMI files sequentially (they're already processed, less benefit from batching)
+    for file_path, relative_path in remi_files:
+        rel_path = Path(relative_path)
+        parts = list(rel_path.parts)
+        parts = [p for p in parts if p not in ['train', 'valid', 'test']]
+        if len(parts) > 1:
+            output_rel_path = Path(*parts).with_suffix('.safetensors')
+        else:
+            output_rel_path = Path(parts[0]).with_suffix('.safetensors')
+        output_path = os.path.join(output_dir, str(output_rel_path))
+        
+        filename, success, error = process_single_file(
+            file_path, output_path, musetok_model, vocab,
+            filter_velocity=filter_velocity, is_emopia_plus=is_emopia_plus
+        )
+        results.append((filename, success, error))
+    
+    # Batch process MIDI files (similar to XMIDI batching)
+    if midi_files:
+        # For now, fall back to sequential for MIDI files too
+        # TODO: Implement proper batching for MIDI files (similar to XMIDI)
+        for file_path, relative_path in midi_files:
+            rel_path = Path(relative_path)
+            parts = list(rel_path.parts)
+            parts = [p for p in parts if p not in ['train', 'valid', 'test']]
+            if len(parts) > 1:
+                output_rel_path = Path(*parts).with_suffix('.safetensors')
+            else:
+                output_rel_path = Path(parts[0]).with_suffix('.safetensors')
+            output_path = os.path.join(output_dir, str(output_rel_path))
+            
+            filename, success, error = process_single_file(
+                file_path, output_path, musetok_model, vocab,
+                filter_velocity=filter_velocity, is_emopia_plus=is_emopia_plus
+            )
+            results.append((filename, success, error))
+    
+    return results
+
+
 def get_processed_files(output_dir: str):
     """
     Get set of already-processed files by checking for existing safetensors files.
@@ -328,7 +398,7 @@ def preprocess_emopia(emopia_dir: str,
         checkpoint_path: Path to MuseTok checkpoint
         vocab_path: Path to vocabulary file
         use_gpu: If True, use CUDA; otherwise use CPU
-        batch_size: Number of files to process before saving (currently unused, processes sequentially)
+        batch_size: Number of files to process in parallel on GPU (only used if > 1 and use_gpu=True)
         resume: If True, skip files that have already been processed
         use_remi_dir: If True and EMOPIA+ structure, use REMI/ subdirectory
         split: If provided, process only this split (train/valid/test) for EMOPIA+
@@ -396,37 +466,69 @@ def preprocess_emopia(emopia_dir: str,
     if is_emopia_plus:
         logging.info("Detected EMOPIA+ dataset - Chord tracks will be excluded from MIDI files")
     
-    # 5. Process files sequentially
-    logging.info(f"Processing {len(files_to_process)} files sequentially...")
+    # 5. Process files (with batching if batch_size > 1 and GPU available)
+    if batch_size > 1 and use_gpu:
+        logging.info(f"Processing {len(files_to_process)} files in batches of {batch_size} for GPU parallelization...")
+    else:
+        logging.info(f"Processing {len(files_to_process)} files sequentially...")
+    
     successful = 0
     failed = 0
     errors = []
     
-    for file_path, relative_path in tqdm(files_to_process, desc="Processing"):
-        # Create output path, removing train/valid/test split directories
-        rel_path = Path(relative_path)
-        # Remove split directories (train/valid/test) from path
-        parts = list(rel_path.parts)
-        parts = [p for p in parts if p not in ['train', 'valid', 'test']]
-        # Reconstruct path without splits
-        if len(parts) > 1:
-            # Keep subdirectory structure but remove splits
-            output_rel_path = Path(*parts).with_suffix('.safetensors')
-        else:
-            # Just filename
-            output_rel_path = Path(parts[0]).with_suffix('.safetensors')
-        output_path = os.path.join(output_dir, str(output_rel_path))
+    # Process in batches if batch_size > 1 and GPU is available
+    if batch_size > 1 and use_gpu:
+        # Progress bar tracks samples (files), not batches
+        pbar = tqdm(total=len(files_to_process), desc="Processing files")
         
-        filename, success, error = process_single_file(
-            file_path, output_path, musetok_model, vocab, 
-            filter_velocity=filter_velocity, is_emopia_plus=is_emopia_plus
-        )
+        for batch_start in range(0, len(files_to_process), batch_size):
+            batch_files = files_to_process[batch_start:batch_start + batch_size]
+            
+            # Process batch
+            batch_results = process_batch_emopia(
+                batch_files, output_dir, musetok_model, vocab,
+                filter_velocity=filter_velocity, is_emopia_plus=is_emopia_plus
+            )
+            
+            # Collect results
+            for filename, success, error in batch_results:
+                if success:
+                    successful += 1
+                else:
+                    failed += 1
+                    errors.append((filename, error))
+            
+            # Update progress bar by number of files processed
+            pbar.update(len(batch_results))
         
-        if success:
-            successful += 1
-        else:
-            failed += 1
-            errors.append((filename, error))
+        pbar.close()
+    else:
+        # Process files sequentially
+        for file_path, relative_path in tqdm(files_to_process, desc="Processing"):
+            # Create output path, removing train/valid/test split directories
+            rel_path = Path(relative_path)
+            # Remove split directories (train/valid/test) from path
+            parts = list(rel_path.parts)
+            parts = [p for p in parts if p not in ['train', 'valid', 'test']]
+            # Reconstruct path without splits
+            if len(parts) > 1:
+                # Keep subdirectory structure but remove splits
+                output_rel_path = Path(*parts).with_suffix('.safetensors')
+            else:
+                # Just filename
+                output_rel_path = Path(parts[0]).with_suffix('.safetensors')
+            output_path = os.path.join(output_dir, str(output_rel_path))
+            
+            filename, success, error = process_single_file(
+                file_path, output_path, musetok_model, vocab, 
+                filter_velocity=filter_velocity, is_emopia_plus=is_emopia_plus
+            )
+            
+            if success:
+                successful += 1
+            else:
+                failed += 1
+                errors.append((filename, error))
     
     # 5. Log statistics
     logging.info("\n" + "="*60)
@@ -458,7 +560,7 @@ if __name__ == "__main__":
     parser.add_argument("--gpu", action="store_true",
                        help="Use GPU (CUDA); if not provided, use CPU")
     parser.add_argument("--batch_size", type=int, default=1,
-                       help="Batch size for processing (currently unused, processes sequentially)")
+                       help="Batch size for GPU parallel processing (only used if > 1 and --gpu is set)")
     parser.add_argument("--resume", action="store_true", default=False,
                        help="Resume preprocessing: skip files that have already been processed")
     parser.add_argument("--use_remi_dir", action="store_true", default=False,

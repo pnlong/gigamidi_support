@@ -555,8 +555,11 @@ def corpus_to_events(data, bar_resol, has_velocity=False, time_first=False, repe
             # Note events
             if len(t_notes):
                 for note in t_notes:
+                    # Filter out notes outside valid MuseTok range (21-108)
+                    # MuseTok vocabulary only supports pitches 21-108
+                    # These are typically percussion or other non-piano instruments
                     if note['pitch'] not in range(21, 109):
-                        raise ValueError(f'invalid pitch value {note["pitch"]}')
+                        continue  # Skip invalid pitches
                     
                     if repeat_beat:
                         events.append(create_event('Beat', (timing - bar_step) // TICK_RESOL))
