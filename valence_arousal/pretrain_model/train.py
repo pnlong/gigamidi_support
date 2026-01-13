@@ -227,29 +227,46 @@ if __name__ == "__main__":
     device = torch.device("cuda" if args.gpu and torch.cuda.is_available() else "cpu")
     logging.info(f"Using device: {device}")
     
-    # Load file lists (assuming they exist in latents_dir/{split}/)
-    def get_file_list(split):
-        split_dir = os.path.join(args.latents_dir, split)
-        if not os.path.exists(split_dir):
-            raise ValueError(f"Split directory not found: {split_dir}")
-        files = [f.replace(".safetensors", "") for f in os.listdir(split_dir) if f.endswith(".safetensors")]
-        return files
+    # Load file lists and split them ourselves
+    # Check if split subdirectories exist (backward compatibility)
+    train_split_dir = os.path.join(args.latents_dir, args.train_split)
+    valid_split_dir = os.path.join(args.latents_dir, args.valid_split)
     
-    train_files = get_file_list(args.train_split)
-    valid_files = get_file_list(args.valid_split)
+    if os.path.exists(train_split_dir) and os.path.exists(valid_split_dir):
+        # Old structure: split subdirectories exist
+        train_files = [f.replace(".safetensors", "") for f in os.listdir(train_split_dir) if f.endswith(".safetensors")]
+        valid_files = [f.replace(".safetensors", "") for f in os.listdir(valid_split_dir) if f.endswith(".safetensors")]
+        train_latents_dir = train_split_dir
+        valid_latents_dir = valid_split_dir
+    else:
+        # New structure: all files in single directory, split them ourselves
+        import random
+        all_files = [f.replace(".safetensors", "") for f in os.listdir(args.latents_dir) if f.endswith(".safetensors")]
+        
+        # Shuffle and split: default 80% train, 20% valid
+        random.seed(42)  # For reproducibility
+        random.shuffle(all_files)
+        split_idx = int(len(all_files) * 0.8)
+        train_files = all_files[:split_idx]
+        valid_files = all_files[split_idx:]
+        
+        logging.info(f"Split {len(all_files)} files: {len(train_files)} train, {len(valid_files)} valid")
+        
+        train_latents_dir = args.latents_dir
+        valid_latents_dir = args.latents_dir
     
     logging.info(f"Train files: {len(train_files)}, Valid files: {len(valid_files)}")
     
     # Create datasets
     train_dataset = ValenceArousalDataset(
-        latents_dir=os.path.join(args.latents_dir, args.train_split),
+        latents_dir=train_latents_dir,
         labels_path=args.labels_path,
         file_list=train_files,
         max_seq_len=args.max_seq_len,
         pool=args.pool,
     )
     valid_dataset = ValenceArousalDataset(
-        latents_dir=os.path.join(args.latents_dir, args.valid_split),
+        latents_dir=valid_latents_dir,
         labels_path=args.labels_path,
         file_list=valid_files,
         max_seq_len=args.max_seq_len,

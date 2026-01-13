@@ -115,7 +115,52 @@ try:
     sys.modules["encoding"] = encoding_module
     encoding_spec.loader.exec_module(encoding_module)
     MuseTokEncoder = encoding_module.MuseTokEncoder
-    convert_event = encoding_module.convert_event
+    
+    # Wrap convert_event to handle missing vocabulary events gracefully
+    _original_convert_event = encoding_module.convert_event
+    def convert_event_safe(event_seq, event2idx, to_ndarr=True):
+        """Wrapper for convert_event that filters out events not in vocabulary."""
+        if len(event_seq) == 0:
+            return np.array([]) if to_ndarr else []
+        
+        if isinstance(event_seq[0], dict):
+            # Filter events that aren't in vocabulary
+            filtered_seq = []
+            for e in event_seq:
+                try:
+                    # CRITICAL: Filter out events with tuple/list/dict values BEFORE processing
+                    # These cause "'<' not supported between instances of 'tuple' and 'int'" errors
+                    event_value = e.get('value')
+                    if isinstance(event_value, (tuple, list, dict)):
+                        # Skip complex values (not in vocabulary format)
+                        continue
+                    
+                    # Handle None values
+                    if event_value is None:
+                        event_key = '{}_{}'.format(e['name'], 'None')
+                    else:
+                        event_key = '{}_{}'.format(e['name'], event_value)
+                    
+                    if event_key in event2idx:
+                        filtered_seq.append(e)
+                except (TypeError, ValueError) as ex:
+                    # Skip events with problematic values
+                    continue
+            event_seq = filtered_seq
+        else:
+            # Filter string events
+            filtered_seq = [e for e in event_seq if e in event2idx]
+            event_seq = filtered_seq
+        
+        if len(event_seq) == 0:
+            # Return empty array if all events filtered
+            return np.array([]) if to_ndarr else []
+        
+        return _original_convert_event(event_seq, event2idx, to_ndarr=to_ndarr)
+    
+    # Replace convert_event in the encoding module so it's used internally
+    encoding_module.convert_event = convert_event_safe
+    convert_event = convert_event_safe
     
 finally:
     # Restore original sys.path and utils module
@@ -419,12 +464,66 @@ def extract_latents_from_events(events: List[Dict],
     Returns:
         latents: numpy array of shape (n_bars, d_vae_latent) where d_vae_latent=128
     """
-    # Filter velocity events if needed
-    if filter_velocity:
-        events = [e for e in events if not (isinstance(e, dict) and e.get('name', '').startswith('Note_Velocity'))]
-        # Recalculate bar positions after filtering
-        # Bar positions are indices into the original events list, so we need to adjust them
-        # For simplicity, we'll recalculate bar positions from the filtered events
+    # Filter events that are not in the vocabulary
+    # Chord events are not in MuseTok vocabulary (they're excluded for emotion prediction)
+    # Velocity events may also need filtering if vocabulary doesn't support them
+    # Some Beat and Duration values from REMI data may also not be in vocabulary
+    original_len = len(events)
+    filtered_events = []
+    skipped_events = []
+    
+    for e in events:
+        if isinstance(e, dict):
+            event_name = e.get('name', '')
+            event_value = e.get('value')
+            
+            # Filter out non-standard events (like Emotion)
+            if event_name not in ['Bar', 'Beat', 'EOS', 'Note_Pitch', 'Note_Duration', 'Note_Velocity', 'Time_Signature']:
+                # Skip events like Emotion, Chord, etc.
+                continue
+            
+            # Filter Chord events (not in vocabulary, not needed for emotion prediction)
+            if event_name.startswith('Chord'):
+                continue
+            
+            # Filter velocity events if needed
+            if filter_velocity and event_name.startswith('Note_Velocity'):
+                continue
+            
+            # CRITICAL: Filter out events with tuple/list/dict values BEFORE they reach convert_event
+            # These cause "'<' not supported between instances of 'tuple' and 'int'" errors
+            # when convert_event tries to process them internally
+            if isinstance(event_value, (tuple, list, dict)):
+                skipped_events.append(f"{event_name}_{type(event_value).__name__}")
+                continue
+            
+            # Handle event value - convert to string safely
+            try:
+                if event_value is None:
+                    event_key = f"{event_name}_None"
+                else:
+                    event_key = f"{event_name}_{event_value}"
+                
+                # Check if event is in vocabulary
+                if event_key not in vocab:
+                    # Event not in vocabulary - skip it
+                    skipped_events.append(event_key)
+                    continue
+            except (TypeError, ValueError) as ex:
+                # Skip events with problematic values
+                skipped_events.append(f"{event_name}_<error>")
+                continue
+        
+        filtered_events.append(e)
+    
+    events = filtered_events
+    
+    # Log skipped events if any (but only for first few to avoid spam)
+    if skipped_events and len(skipped_events) <= 5:
+        logging.debug(f"Skipped {len(skipped_events)} events not in vocabulary: {skipped_events[:5]}")
+    
+    # Recalculate bar positions after filtering (if we filtered anything)
+    if len(events) != original_len:
         piece_bar_pos = []
         for i, event in enumerate(events):
             if isinstance(event, dict) and event.get('name') == 'Bar':
@@ -450,7 +549,8 @@ def extract_latents_from_midi(midi_path_or_bytes: Union[str, bytes],
                               vocab: dict,
                               has_velocity: bool = False,
                               time_first: bool = False,
-                              repeat_beat: bool = True) -> Tuple[np.ndarray, List[int]]:
+                              repeat_beat: bool = True,
+                              exclude_tracks: Optional[List[str]] = None) -> Tuple[np.ndarray, List[int]]:
     """
     Full pipeline: MIDI -> REMI events -> latents.
     
@@ -467,20 +567,22 @@ def extract_latents_from_midi(midi_path_or_bytes: Union[str, bytes],
         has_velocity: Whether to include velocity in events
         time_first: Whether to put time signature at start of bar
         repeat_beat: Whether to repeat beat event for each note
+        exclude_tracks: List of track names to exclude (e.g., ['Chord'] for EMOPIA+)
     
     Returns:
         latents: numpy array of shape (n_bars, d_vae_latent) where d_vae_latent=128
         bar_positions: List of event indices where bars start (in the original event sequence)
     """
     # Load MIDI with symusic
-    score = load_midi_symusic(midi_path_or_bytes)
+    score = load_midi_symusic(midi_path_or_bytes, exclude_tracks=exclude_tracks)
     
     # Convert to REMI events
     bar_positions, events = midi_to_events_symusic(
         score,
         has_velocity=has_velocity,
         time_first=time_first,
-        repeat_beat=repeat_beat
+        repeat_beat=repeat_beat,
+        exclude_tracks=exclude_tracks
     )
     
     # Extract latents

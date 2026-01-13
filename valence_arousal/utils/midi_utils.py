@@ -170,19 +170,35 @@ def load_midi_symusic(midi_path_or_bytes: Union[str, bytes], exclude_tracks: Opt
         score = Score(midi_path_or_bytes)
     
     # For EMOPIA MIDI files: exclude Chord track, keep Melody + Texture + Bass
+    # Store exclude_tracks for later use (try to set as attribute, but don't fail if not supported)
+    saved_exclude_tracks = exclude_tracks
     if exclude_tracks:
         # Filter out tracks matching exclude_tracks names
         # This ensures we use all tracks except Chord for emotion prediction
         # Note: symusic Score tracks might be immutable, so we filter during processing
         # The actual filtering happens in score_to_corpus_strict when processing notes
-        # Store exclude_tracks in score metadata for later use
-        if not hasattr(score, '_exclude_tracks'):
-            score._exclude_tracks = exclude_tracks
+        # Try to store exclude_tracks in score metadata for later use
+        try:
+            if not hasattr(score, '_exclude_tracks'):
+                score._exclude_tracks = exclude_tracks
+        except (AttributeError, TypeError):
+            # Some Score types (like ScoreTick) don't support arbitrary attributes
+            # We'll pass exclude_tracks as a parameter instead
+            pass
     
     # Convert ticks_per_quarter to 480 (BEAT_RESOL) if needed
     if score.ticks_per_quarter != BEAT_RESOL:
         logging.debug(f"Converting MIDI from {score.ticks_per_quarter} to {BEAT_RESOL} ticks_per_quarter")
+        # Save exclude_tracks before conversion (convert_ticks_per_quarter returns a new object)
+        saved_exclude_tracks = getattr(score, '_exclude_tracks', saved_exclude_tracks)
         score = convert_ticks_per_quarter(score, BEAT_RESOL)
+        # Restore exclude_tracks on the converted score (if supported)
+        if saved_exclude_tracks is not None:
+            try:
+                score._exclude_tracks = saved_exclude_tracks
+            except (AttributeError, TypeError):
+                # Some Score types don't support arbitrary attributes
+                pass
     
     return score
 
@@ -204,17 +220,31 @@ def get_tempo(score: Score) -> float:
     """
     Extract tempo (BPM) from score.
     Returns median tempo, default to DEFAULT_TEMPO (from midi2events.py analyzer logic).
+    
+    Note: symusic TempoTick objects use 'qpm' (quarters per minute) or 'tempo' attribute,
+    not 'bpm'. Both represent the same value (BPM).
     """
     if len(score.tempos) == 0:
         return DEFAULT_TEMPO
     
     # Get first 40 tempo changes and compute median
-    tempos = [t.bpm for t in score.tempos[:40]]
+    # Use qpm (quarters per minute) which is equivalent to BPM
+    # Fallback to tempo attribute if qpm is not available
+    tempos = []
+    for t in score.tempos[:40]:
+        if hasattr(t, 'qpm'):
+            tempos.append(t.qpm)
+        elif hasattr(t, 'tempo'):
+            tempos.append(t.tempo)
+        else:
+            # Fallback: try to get value directly
+            continue
+    
     tempo_median = np.median(tempos) if tempos else DEFAULT_TEMPO
     return float(tempo_median)
 
 
-def score_to_corpus_strict(score: Score, bar_resol: int, remove_overlap: bool = True):
+def score_to_corpus_strict(score: Score, bar_resol: int, remove_overlap: bool = True, exclude_tracks: Optional[List[str]] = None):
     """
     Quantize MIDI data from symusic Score (adapted from midi2events.py midi2corpus_strict).
     
@@ -227,7 +257,7 @@ def score_to_corpus_strict(score: Score, bar_resol: int, remove_overlap: bool = 
     # Collect all notes from all tracks
     # Note: symusic API - tracks is a list, each track has notes
     # For EMOPIA: exclude Chord track if specified
-    exclude_tracks = getattr(score, '_exclude_tracks', None)
+    # exclude_tracks is now passed as a parameter instead of stored on score object
     
     all_notes = []
     for track in score.tracks:
@@ -571,7 +601,8 @@ def midi_to_events_symusic(score: Score,
                           has_velocity: bool = False,
                           time_first: bool = False,
                           repeat_beat: bool = True,
-                          remove_overlap: bool = True) -> Tuple[List[int], List[Dict[str, any]]]:
+                          remove_overlap: bool = True,
+                          exclude_tracks: Optional[List[str]] = None) -> Tuple[List[int], List[Dict[str, any]]]:
     """
     Convert symusic Score to REMI events.
     
@@ -592,9 +623,22 @@ def midi_to_events_symusic(score: Score,
         events: List of event dictionaries with 'name' and 'value' keys
     """
     # Ensure ticks_per_quarter is 480 (should already be converted in load_midi_symusic)
+    # Also try to get exclude_tracks from score attribute if not provided as parameter
+    if exclude_tracks is None:
+        exclude_tracks = getattr(score, '_exclude_tracks', None)
+    
     if score.ticks_per_quarter != BEAT_RESOL:
         logging.warning(f"Score has ticks_per_quarter={score.ticks_per_quarter}, expected {BEAT_RESOL}. Converting...")
+        # Save exclude_tracks before conversion
+        saved_exclude = exclude_tracks
         score = convert_ticks_per_quarter(score, BEAT_RESOL)
+        # Restore exclude_tracks (try to set on new score, but don't fail if not supported)
+        if saved_exclude is not None:
+            try:
+                score._exclude_tracks = saved_exclude
+            except (AttributeError, TypeError):
+                pass
+        exclude_tracks = saved_exclude
     
     # Get time signature and compute bar_resol
     time_sig_num, time_sig_den = get_time_signature(score)
@@ -602,7 +646,7 @@ def midi_to_events_symusic(score: Score,
     bar_resol = int(BEAT_RESOL * quarters_per_bar)
     
     # Convert score to quantized corpus
-    song_data = score_to_corpus_strict(score, bar_resol, remove_overlap=remove_overlap)
+    song_data = score_to_corpus_strict(score, bar_resol, remove_overlap=remove_overlap, exclude_tracks=exclude_tracks)
     
     # Convert corpus to events
     bar_positions, events = corpus_to_events(

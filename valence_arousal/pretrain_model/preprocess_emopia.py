@@ -144,7 +144,8 @@ def process_single_file(file_path: str,
                       output_path: str,
                       musetok_model,
                       vocab: dict,
-                      filter_velocity: bool = False):
+                      filter_velocity: bool = False,
+                      is_emopia_plus: bool = False):
     """
     Process a single file (MIDI or REMI pickle).
     
@@ -180,12 +181,13 @@ def process_single_file(file_path: str,
             
         elif is_midi_file(file_path):
             # Full pipeline: MIDI → REMI → latents
-            # Note: For EMOPIA MIDI files, merge Melody + Texture + Bass tracks
-            # (exclude Chord track) when loading MIDI
-            # extract_latents_from_midi has has_velocity parameter, but we use filter_velocity logic
-            # If filter_velocity is True, we don't want velocity in the MIDI conversion either
+            # Note: For EMOPIA+ MIDI files, exclude Chord track (4th track)
+            # This only applies to EMOPIA+, not to other datasets
+            exclude_tracks = ['Chord'] if is_emopia_plus else None
             latents, bar_positions = extract_latents_from_midi(
-                file_path, musetok_model, vocab, has_velocity=not filter_velocity
+                file_path, musetok_model, vocab, 
+                has_velocity=not filter_velocity,
+                exclude_tracks=exclude_tracks
             )
             
             file_type = "midi"
@@ -388,18 +390,36 @@ def preprocess_emopia(emopia_dir: str,
     if filter_velocity:
         logging.info("Vocabulary does not include velocity - velocity events will be filtered")
     
-    # 4. Process files sequentially
+    # 4. Detect if we're processing EMOPIA+ (to exclude Chord tracks from MIDI)
+    # EMOPIA+ is located at /deepfreeze/pnlong/gigamidi/emopia/emopia_plus
+    is_emopia_plus = 'emopia_plus' in emopia_dir or 'emopia/emopia_plus' in emopia_dir
+    if is_emopia_plus:
+        logging.info("Detected EMOPIA+ dataset - Chord tracks will be excluded from MIDI files")
+    
+    # 5. Process files sequentially
     logging.info(f"Processing {len(files_to_process)} files sequentially...")
     successful = 0
     failed = 0
     errors = []
     
     for file_path, relative_path in tqdm(files_to_process, desc="Processing"):
-        # Preserve directory structure in output
-        output_path = os.path.join(output_dir, str(Path(relative_path).with_suffix('.safetensors')))
+        # Create output path, removing train/valid/test split directories
+        rel_path = Path(relative_path)
+        # Remove split directories (train/valid/test) from path
+        parts = list(rel_path.parts)
+        parts = [p for p in parts if p not in ['train', 'valid', 'test']]
+        # Reconstruct path without splits
+        if len(parts) > 1:
+            # Keep subdirectory structure but remove splits
+            output_rel_path = Path(*parts).with_suffix('.safetensors')
+        else:
+            # Just filename
+            output_rel_path = Path(parts[0]).with_suffix('.safetensors')
+        output_path = os.path.join(output_dir, str(output_rel_path))
         
         filename, success, error = process_single_file(
-            file_path, output_path, musetok_model, vocab, filter_velocity
+            file_path, output_path, musetok_model, vocab, 
+            filter_velocity=filter_velocity, is_emopia_plus=is_emopia_plus
         )
         
         if success:

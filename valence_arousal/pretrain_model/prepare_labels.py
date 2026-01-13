@@ -237,9 +237,11 @@ def load_labels_from_filenames(emopia_dir: str) -> dict:
     """
     labels = {}
     
-    # Find all .pkl and .mid/.midi files
+    # Find all .pkl and .mid/.midi files (recursive search)
+    # Note: glob with recursive=True requires **/ in the pattern
     for ext in ['*.pkl', '*.mid', '*.midi', '*.MID', '*.MIDI']:
-        for filepath in glob.glob(os.path.join(emopia_dir, ext), recursive=True):
+        pattern = os.path.join(emopia_dir, '**', ext)
+        for filepath in glob.glob(pattern, recursive=True):
             filename = Path(filepath).stem
             
             # Try Q1-Q4 extraction first (most reliable for EMOPIA)
@@ -262,9 +264,9 @@ def load_emopia_labels(emopia_dir: str) -> dict:
     Load EMOPIA emotion labels from various possible formats.
     
     Tries multiple methods in order:
-    1. CSV files
-    2. JSON files
-    3. Filename patterns
+    1. Filename patterns (primary method - most reliable for EMOPIA+ and edited EMOPIA)
+    2. CSV files (if available)
+    3. JSON files (if available)
     
     Args:
         emopia_dir: EMOPIA dataset directory
@@ -274,25 +276,32 @@ def load_emopia_labels(emopia_dir: str) -> dict:
     """
     labels = {}
     
+    # Always try filenames first (primary method for EMOPIA+ and edited EMOPIA)
+    # Filenames are the most reliable source since both variants use Q1-Q4 naming
+    logging.info("Attempting to extract labels from filenames...")
+    filename_labels = load_labels_from_filenames(emopia_dir)
+    if filename_labels:
+        labels.update(filename_labels)
+        logging.info(f"Extracted {len(filename_labels)} labels from filenames")
+    else:
+        logging.warning("No labels found in filenames - trying CSV/JSON files...")
+    
+    # Also try CSV/JSON files as supplementary sources
     logging.info("Attempting to load labels from CSV files...")
     csv_labels = load_labels_from_csv(emopia_dir)
     if csv_labels:
-        labels.update(csv_labels)
-        logging.info(f"Loaded {len(csv_labels)} labels from CSV")
+        # Only add CSV labels that aren't already in filename labels
+        new_csv_labels = {k: v for k, v in csv_labels.items() if k not in labels}
+        labels.update(new_csv_labels)
+        logging.info(f"Loaded {len(csv_labels)} labels from CSV ({len(new_csv_labels)} new)")
     
     logging.info("Attempting to load labels from JSON files...")
     json_labels = load_labels_from_json(emopia_dir)
     if json_labels:
-        labels.update(json_labels)
-        logging.info(f"Loaded {len(json_labels)} labels from JSON")
-    
-    # Only try filenames if we haven't found many labels
-    if len(labels) < 10:
-        logging.info("Attempting to extract labels from filenames...")
-        filename_labels = load_labels_from_filenames(emopia_dir)
-        if filename_labels:
-            labels.update(filename_labels)
-            logging.info(f"Extracted {len(filename_labels)} labels from filenames")
+        # Only add JSON labels that aren't already in filename labels
+        new_json_labels = {k: v for k, v in json_labels.items() if k not in labels}
+        labels.update(new_json_labels)
+        logging.info(f"Loaded {len(json_labels)} labels from JSON ({len(new_json_labels)} new)")
     
     return labels
 

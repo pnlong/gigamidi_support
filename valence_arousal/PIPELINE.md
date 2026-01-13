@@ -64,7 +64,6 @@ python pretrain_model/preprocess_emopia.py \
     --emopia_dir /deepfreeze/pnlong/gigamidi/emopia/emopia_plus \
     --output_dir /deepfreeze/pnlong/gigamidi/emopia/latents/emopia_plus \
     --use_remi_dir \
-    --split train \
     --gpu \
     --batch_size 8 \
     --resume
@@ -76,7 +75,6 @@ python pretrain_model/preprocess_emopia.py \
 python pretrain_model/preprocess_emopia.py \
     --emopia_dir /deepfreeze/pnlong/gigamidi/emopia/emopia_plus \
     --output_dir /deepfreeze/pnlong/gigamidi/emopia/latents/emopia_plus \
-    --split train \
     --gpu \
     --batch_size 8 \
     --resume
@@ -87,7 +85,7 @@ python pretrain_model/preprocess_emopia.py \
 - For EMOPIA+ with splits: 
   - If `--split` is not provided, all splits (train/valid/test) will be processed automatically
   - To process a specific split only: `--split train`, `--split valid`, or `--split test`
-- Output structure will mirror input structure (preserves train/valid/test splits)
+- Output structure: Files are saved directly in the output directory (train/valid/test split directories are removed)
 
 ### 2.2 Prepare Continuous VA Labels
 

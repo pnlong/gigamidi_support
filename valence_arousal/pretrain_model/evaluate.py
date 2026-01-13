@@ -77,12 +77,21 @@ if __name__ == "__main__":
     model.eval()
     
     # Load test files
-    test_dir = os.path.join(args.latents_dir, args.test_split)
-    test_files = [f.replace(".safetensors", "") for f in os.listdir(test_dir) if f.endswith(".safetensors")]
+    # Check if split subdirectory exists (backward compatibility)
+    test_split_dir = os.path.join(args.latents_dir, args.test_split)
+    if os.path.exists(test_split_dir):
+        # Old structure: split subdirectory exists
+        test_files = [f.replace(".safetensors", "") for f in os.listdir(test_split_dir) if f.endswith(".safetensors")]
+        test_latents_dir = test_split_dir
+    else:
+        # New structure: all files in single directory, use all for test
+        test_files = [f.replace(".safetensors", "") for f in os.listdir(args.latents_dir) if f.endswith(".safetensors")]
+        test_latents_dir = args.latents_dir
+        logging.info(f"Using all {len(test_files)} files in latents_dir for testing")
     
     # Create dataset
     test_dataset = ValenceArousalDataset(
-        latents_dir=test_dir,
+        latents_dir=test_latents_dir,
         labels_path=args.labels_path,
         file_list=test_files,
         max_seq_len=args.max_seq_len,
