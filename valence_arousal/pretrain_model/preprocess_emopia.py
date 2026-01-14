@@ -54,6 +54,7 @@ import sys
 import glob
 import torch
 from typing import List, Tuple
+from multiprocessing import Pool, cpu_count
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
@@ -140,6 +141,50 @@ def load_remi_from_pickle(pkl_path: str):
         raise ValueError(f"Unexpected pickle format in {pkl_path}: data is type {type(data)}")
     
     return events, bar_positions
+
+# Global variables for worker processes (loaded once per worker via initializer)
+_worker_model_emopia = None
+_worker_vocab_emopia = None
+_worker_filter_velocity = None
+_worker_is_emopia_plus = None
+
+def _init_worker_emopia(checkpoint_path, vocab_path, use_gpu, filter_velocity, is_emopia_plus):
+    """
+    Initialize worker process - load model once per worker.
+    This is called once when each worker process starts.
+    """
+    global _worker_model_emopia, _worker_vocab_emopia, _worker_filter_velocity, _worker_is_emopia_plus
+    _worker_model_emopia, _worker_vocab_emopia, _ = load_musetok_model(
+        checkpoint_path=checkpoint_path,
+        vocab_path=vocab_path,
+        use_gpu=use_gpu,
+    )
+    _worker_filter_velocity = filter_velocity
+    _worker_is_emopia_plus = is_emopia_plus
+
+def _process_file_worker_emopia(args_tuple):
+    """
+    Worker function for multiprocessing.
+    Uses pre-loaded model from worker's global variables (loaded once per worker).
+    
+    Args:
+        args_tuple: (file_path, output_path)
+    
+    Returns:
+        (filename, success, error_message)
+    """
+    file_path, output_path = args_tuple
+    
+    try:
+        # Use pre-loaded model from worker's global variables
+        # Process file
+        return process_single_file(
+            file_path, output_path, _worker_model_emopia, _worker_vocab_emopia,
+            filter_velocity=_worker_filter_velocity, is_emopia_plus=_worker_is_emopia_plus
+        )
+    except Exception as e:
+        return (Path(file_path).stem, False, str(e))
+
 
 def process_single_file(file_path: str,
                       output_path: str,
@@ -388,7 +433,8 @@ def preprocess_emopia(emopia_dir: str,
                      resume: bool = False,
                      use_remi_dir: bool = False,
                      split: str = None,
-                     prefer_velocity: bool = False):
+                     prefer_velocity: bool = False,
+                     num_workers: int = None):
     """
     Preprocess EMOPIA dataset (supports both edited EMOPIA and EMOPIA+).
     
@@ -403,6 +449,7 @@ def preprocess_emopia(emopia_dir: str,
         use_remi_dir: If True and EMOPIA+ structure, use REMI/ subdirectory
         split: If provided, process only this split (train/valid/test) for EMOPIA+
         prefer_velocity: If True, prefer velocity vocabulary (will fallback with warning if not available)
+        num_workers: Number of worker processes for CPU multiprocessing (None = auto-detect, 0 = sequential)
     """
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     
@@ -445,19 +492,52 @@ def preprocess_emopia(emopia_dir: str,
         logging.info("All files already processed. Nothing to do.")
         return
     
-    # 3. Load model once (shared across all files)
-    logging.info("Loading MuseTok model...")
-    musetok_model, vocab, use_velocity = load_musetok_model(
-        checkpoint_path=checkpoint_path,
-        vocab_path=vocab_path,
-        use_gpu=use_gpu,
-        prefer_velocity=prefer_velocity,
-    )
-    logging.info(f"Model loaded successfully (velocity support: {use_velocity})")
+    # 3. Determine processing mode
+    use_multiprocessing = not use_gpu and (num_workers is None or num_workers > 0)  # Use multiprocessing on CPU
+    use_gpu_batching = batch_size > 1 and use_gpu  # GPU batching for GPU mode
+    
+    # Auto-detect num_workers for CPU multiprocessing
+    if use_multiprocessing and num_workers is None:
+        num_workers = max(1, cpu_count() // 4)  # Use 1/4 of available CPUs
+        logging.info(f"Auto-detected {num_workers} workers for CPU multiprocessing")
+    elif num_workers == 0:
+        use_multiprocessing = False
+    
+    if use_multiprocessing:
+        logging.info(f"Using multiprocessing with {num_workers} workers (CPU mode)")
+    elif use_gpu_batching:
+        logging.info(f"Using GPU batching with batch_size={batch_size}")
+    else:
+        logging.info("Using sequential processing")
+    
+    # Load model (only if not using multiprocessing - workers will load their own)
+    musetok_model = None
+    vocab = None
+    use_velocity = None
+    if not use_multiprocessing:
+        logging.info("Loading MuseTok model...")
+        musetok_model, vocab, use_velocity = load_musetok_model(
+            checkpoint_path=checkpoint_path,
+            vocab_path=vocab_path,
+            use_gpu=use_gpu,
+            prefer_velocity=prefer_velocity,
+        )
+        logging.info(f"Model loaded successfully (velocity support: {use_velocity})")
+    else:
+        # For multiprocessing, we need to know velocity support
+        # Load model temporarily just to check vocabulary (workers will reload)
+        temp_model, temp_vocab, use_velocity = load_musetok_model(
+            checkpoint_path=checkpoint_path,
+            vocab_path=vocab_path,
+            use_gpu=False,  # Always CPU for this check
+            prefer_velocity=prefer_velocity,
+        )
+        del temp_model, temp_vocab  # Free memory
+        logging.info(f"Velocity support: {use_velocity} (workers will load model)")
     
     # Determine if we need to filter velocity events
-    filter_velocity = not use_velocity
-    if filter_velocity:
+    filter_velocity = not use_velocity if use_velocity is not None else True
+    if filter_velocity and use_velocity is not None:
         logging.info("Vocabulary does not include velocity - velocity events will be filtered")
     
     # 4. Detect if we're processing EMOPIA+ (to exclude Chord tracks from MIDI)
@@ -466,18 +546,47 @@ def preprocess_emopia(emopia_dir: str,
     if is_emopia_plus:
         logging.info("Detected EMOPIA+ dataset - Chord tracks will be excluded from MIDI files")
     
-    # 5. Process files (with batching if batch_size > 1 and GPU available)
-    if batch_size > 1 and use_gpu:
-        logging.info(f"Processing {len(files_to_process)} files in batches of {batch_size} for GPU parallelization...")
-    else:
-        logging.info(f"Processing {len(files_to_process)} files sequentially...")
-    
+    # 5. Process files
     successful = 0
     failed = 0
     errors = []
     
-    # Process in batches if batch_size > 1 and GPU is available
-    if batch_size > 1 and use_gpu:
+    if use_multiprocessing:
+        # Multiprocessing mode (CPU)
+        # Prepare arguments for workers (simplified - model loaded via initializer)
+        worker_args = []
+        for file_path, relative_path in files_to_process:
+            # Create output path
+            rel_path = Path(relative_path)
+            parts = list(rel_path.parts)
+            parts = [p for p in parts if p not in ['train', 'valid', 'test']]
+            if len(parts) > 1:
+                output_rel_path = Path(*parts).with_suffix('.safetensors')
+            else:
+                output_rel_path = Path(parts[0]).with_suffix('.safetensors')
+            output_path = os.path.join(output_dir, str(output_rel_path))
+            
+            worker_args.append((file_path, output_path))
+        
+        # Process with multiprocessing pool
+        # initializer loads model once per worker, not per file
+        with Pool(processes=num_workers, initializer=_init_worker_emopia,
+                  initargs=(checkpoint_path, vocab_path, use_gpu, filter_velocity, is_emopia_plus)) as pool:
+            results = list(tqdm(
+                pool.imap(_process_file_worker_emopia, worker_args),
+                total=len(files_to_process),
+                desc="Processing files"
+            ))
+        
+        # Collect results
+        for filename, success, error in results:
+            if success:
+                successful += 1
+            else:
+                failed += 1
+                errors.append((filename, error))
+    
+    elif use_gpu_batching:
         # Progress bar tracks samples (files), not batches
         pbar = tqdm(total=len(files_to_process), desc="Processing files")
         
@@ -561,6 +670,8 @@ if __name__ == "__main__":
                        help="Use GPU (CUDA); if not provided, use CPU")
     parser.add_argument("--batch_size", type=int, default=1,
                        help="Batch size for GPU parallel processing (only used if > 1 and --gpu is set)")
+    parser.add_argument("--num_workers", type=int, default=None,
+                       help="Number of worker processes for CPU multiprocessing (None = auto-detect, 0 = sequential)")
     parser.add_argument("--resume", action="store_true", default=False,
                        help="Resume preprocessing: skip files that have already been processed")
     parser.add_argument("--use_remi_dir", action="store_true", default=False,
@@ -591,5 +702,6 @@ if __name__ == "__main__":
         args.resume,
         args.use_remi_dir,
         args.split,
-        args.velocity
+        args.velocity,
+        args.num_workers
     )

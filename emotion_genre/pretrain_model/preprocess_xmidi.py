@@ -28,6 +28,7 @@ import re
 import torch
 import numpy as np
 from typing import List
+from multiprocessing import Pool, cpu_count
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
@@ -77,6 +78,48 @@ def extract_metadata_from_filename(filename: str):
 def is_midi_file(filepath: str) -> bool:
     """Check if file is a MIDI file."""
     return filepath.lower().endswith(('.mid', '.midi'))
+
+
+# Global variables for worker processes (loaded once per worker via initializer)
+_worker_model = None
+_worker_vocab = None
+
+def _init_worker(checkpoint_path, vocab_path, use_gpu):
+    """
+    Initialize worker process - load model once per worker.
+    This is called once when each worker process starts.
+    """
+    global _worker_model, _worker_vocab
+    _worker_model, _worker_vocab, _ = load_musetok_model(
+        checkpoint_path=checkpoint_path,
+        vocab_path=vocab_path,
+        use_gpu=use_gpu
+    )
+
+def _process_file_worker(args_tuple):
+    """
+    Worker function for multiprocessing.
+    Uses pre-loaded model from worker's global variables (loaded once per worker).
+    
+    Args:
+        args_tuple: (file_path, output_dir)
+    
+    Returns:
+        (filename, success, error_message)
+    """
+    file_path, output_dir = args_tuple
+    
+    try:
+        # Use pre-loaded model from worker's global variables
+        # Process file
+        filename = Path(file_path).stem
+        output_path = os.path.join(output_dir, f"{filename}.safetensors")
+        
+        return process_single_file(
+            file_path, output_path, _worker_model, _worker_vocab
+        )
+    except Exception as e:
+        return (Path(file_path).stem, False, str(e))
 
 
 def process_single_file(file_path: str,
@@ -339,7 +382,8 @@ def preprocess_xmidi(xmidi_dir: str,
                     vocab_path: str = None,
                     use_gpu: bool = False,
                     resume: bool = False,
-                    batch_size: int = 1):
+                    batch_size: int = 1,
+                    num_workers: int = None):
     """
     Preprocess XMIDI dataset.
     
@@ -351,6 +395,7 @@ def preprocess_xmidi(xmidi_dir: str,
         use_gpu: If True, use CUDA; otherwise use CPU
         resume: If True, skip files that have already been processed
         batch_size: Number of files to process in parallel on GPU (only used if > 1 and use_gpu=True)
+        num_workers: Number of worker processes for CPU multiprocessing (None = auto-detect, 0 = sequential)
     """
     # Setup logging
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -363,14 +408,35 @@ def preprocess_xmidi(xmidi_dir: str,
     if checkpoint_path is None:
         checkpoint_path = os.path.join(MUSETOK_CHECKPOINT_DIR, "best_tokenizer.pt")
     
-    # Load MuseTok model (once, before processing)
-    logging.info("Loading MuseTok model...")
-    musetok_model, vocab, use_velocity = load_musetok_model(
-        checkpoint_path=checkpoint_path,
-        vocab_path=vocab_path,
-        use_gpu=use_gpu
-    )
-    logging.info(f"MuseTok model loaded (vocabulary size: {len(vocab)}, velocity: {use_velocity})")
+    # Determine processing mode
+    use_multiprocessing = not use_gpu and (num_workers is None or num_workers > 0)  # Use multiprocessing on CPU
+    use_gpu_batching = batch_size > 1 and use_gpu  # GPU batching for GPU mode
+    
+    # Auto-detect num_workers for CPU multiprocessing
+    if use_multiprocessing and num_workers is None:
+        num_workers = max(1, cpu_count() // 4)  # Use 1/4 of available CPUs
+        logging.info(f"Auto-detected {num_workers} workers for CPU multiprocessing")
+    elif num_workers == 0:
+        use_multiprocessing = False
+    
+    if use_multiprocessing:
+        logging.info(f"Using multiprocessing with {num_workers} workers (CPU mode)")
+    elif use_gpu_batching:
+        logging.info(f"Using GPU batching with batch_size={batch_size}")
+    else:
+        logging.info("Using sequential processing")
+    
+    # Load MuseTok model (only if not using multiprocessing - workers will load their own)
+    musetok_model = None
+    vocab = None
+    if not use_multiprocessing:
+        logging.info("Loading MuseTok model...")
+        musetok_model, vocab, use_velocity = load_musetok_model(
+            checkpoint_path=checkpoint_path,
+            vocab_path=vocab_path,
+            use_gpu=use_gpu
+        )
+        logging.info(f"MuseTok model loaded (vocabulary size: {len(vocab)}, velocity: {use_velocity})")
     
     # Find all MIDI files
     logging.info(f"Searching for MIDI files in {xmidi_dir}...")
@@ -401,13 +467,40 @@ def preprocess_xmidi(xmidi_dir: str,
     # Create output directory
     ensure_dir(output_dir)
     
-    # Process files in batches for GPU parallelization
+    # Process files
     successful = 0
     failed = 0
     errors = []
     
-    # Process in batches
-    if batch_size > 1 and use_gpu:
+    if use_multiprocessing:
+        # Multiprocessing mode (CPU)
+        # Prepare arguments for workers (simplified - model loaded via initializer)
+        worker_args = [
+            (file_path, output_dir)
+            for file_path in files_to_process
+        ]
+        
+        # Process with multiprocessing pool
+        # initializer loads model once per worker, not per file
+        with Pool(processes=num_workers, initializer=_init_worker, 
+                  initargs=(checkpoint_path, vocab_path, use_gpu)) as pool:
+            results = list(tqdm(
+                pool.imap(_process_file_worker, worker_args),
+                total=len(files_to_process),
+                desc="Processing files"
+            ))
+        
+        # Collect results
+        for result in results:
+            if result[1]:  # success
+                successful += 1
+            else:
+                failed += 1
+                errors.append((result[0], result[2]))  # (filename, error_message)
+                logging.warning(f"Failed to process {result[0]}: {result[2]}")
+    
+    elif use_gpu_batching:
+        # GPU batching mode
         logging.info(f"Processing files in batches of {batch_size} for GPU parallelization")
         # Progress bar tracks samples (files), not batches
         pbar = tqdm(total=len(files_to_process), desc="Processing files")
@@ -434,7 +527,7 @@ def preprocess_xmidi(xmidi_dir: str,
         
         pbar.close()
     else:
-        # Process files sequentially (CPU or batch_size=1)
+        # Sequential processing (CPU or batch_size=1)
         logging.info("Processing files sequentially")
         for file_path in tqdm(files_to_process, desc="Processing files"):
             filename = Path(file_path).stem
@@ -479,9 +572,11 @@ if __name__ == "__main__":
                        help="Resume preprocessing: skip files that have already been processed")
     parser.add_argument("--batch_size", type=int, default=1,
                        help="Batch size for GPU parallel processing (only used if > 1 and --gpu is set)")
+    parser.add_argument("--num_workers", type=int, default=None,
+                       help="Number of worker processes for CPU multiprocessing (None = auto-detect, 0 = sequential)")
     args = parser.parse_args()
     
     preprocess_xmidi(
         args.xmidi_dir, args.output_dir, args.checkpoint_path,
-        args.vocab_path, args.gpu, args.resume, args.batch_size
+        args.vocab_path, args.gpu, args.resume, args.batch_size, args.num_workers
     )
