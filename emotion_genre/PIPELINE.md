@@ -84,10 +84,10 @@ python pretrain_model/train.py \
     --num_classes 11 \
     --input_dim 128 \
     --hidden_dim 64 \
-    --batch_size 32 \
+    --batch_size 2048 \
     --learning_rate 1e-4 \
     --weight_decay 1e-5 \
-    --epochs 100 \
+    --epochs 75 \
     --dropout 0.1 \
     --gpu \
     --num_workers 4 \
@@ -111,10 +111,10 @@ python pretrain_model/train.py \
     --num_classes 6 \
     --input_dim 128 \
     --hidden_dim 64 \
-    --batch_size 32 \
+    --batch_size 2048 \
     --learning_rate 1e-4 \
     --weight_decay 1e-5 \
-    --epochs 100 \
+    --epochs 75 \
     --dropout 0.1 \
     --gpu \
     --num_workers 4 \
@@ -178,6 +178,75 @@ python pretrain_model/evaluate.py \
 
 ---
 
+## Phase 4: GigaMIDI Annotation
+
+After training and evaluating the emotion and genre classifiers, use them to annotate the GigaMIDI dataset.
+
+### 4.1 Annotate GigaMIDI with Emotion and Genre Predictions
+
+```bash
+python annotate_gigamidi.py \
+    --emotion_model_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/checkpoints/trained_models/emotion_classifier/checkpoints/best_model.pt \
+    --genre_model_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/checkpoints/trained_models/genre_classifier/checkpoints/best_model.pt \
+    --emotion_class_to_index_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/emotion_to_index.json \
+    --genre_class_to_index_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/genre_to_index.json \
+    --input_dim 128 \
+    --emotion_num_classes 11 \
+    --genre_num_classes 6 \
+    --hidden_dim 64 \
+    --dropout 0.1 \
+    --gpu \
+    --streaming \
+    --split train \
+    --resume \
+    --output_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/gigamidi_annotations/annotations.csv
+```
+
+**Key Arguments**:
+- `--emotion_model_path`: Path to trained emotion classifier checkpoint
+- `--genre_model_path`: Path to trained genre classifier checkpoint
+- `--emotion_class_to_index_path`: Path to emotion_to_index.json (for mapping indices to class names)
+- `--genre_class_to_index_path`: Path to genre_to_index.json (for mapping indices to class names)
+- `--streaming`: Use streaming mode to avoid downloading entire dataset (recommended)
+- `--split`: Dataset split to annotate (`train`, `test`, or `validation`)
+- `--resume`: Resume from existing CSV file (skip already-processed songs)
+- `--output_path`: Output CSV file path (defaults to `<STORAGE_DIR>/xmidi_emotion_genre/gigamidi_annotations/annotations.csv`)
+
+**Output Format**: CSV file with columns:
+- `md5`: Song identifier (MD5 hash)
+- `emotion`: Predicted emotion class (string: one of 11 emotions)
+- `emotion_prob`: Confidence/probability for emotion prediction (0-1)
+- `genre`: Predicted genre class (string: one of 6 genres)
+- `genre_prob`: Confidence/probability for genre prediction (0-1)
+
+**Note**: 
+- The script processes songs one at a time, extracting latents on-the-fly
+- Mean pooling is applied across bars to get song-level predictions
+- Progress is saved incrementally (one row per song) to avoid losing work
+- Use `--resume` to continue from where you left off if interrupted
+
+### 4.2 Analyze Annotations (Optional)
+
+After annotation, you can analyze the distribution of predictions:
+
+```bash
+# Print statistics
+python analyze_annotations/print_statistics.py \
+    --annotations_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/gigamidi_annotations/annotations.csv
+
+# Plot histograms
+python analyze_annotations/plot_histograms.py \
+    --annotations_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/gigamidi_annotations/annotations.csv \
+    --output_dir /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/gigamidi_annotations/plots
+
+# Plot by genre
+python analyze_annotations/plot_by_genre.py \
+    --annotations_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/gigamidi_annotations/annotations.csv \
+    --output_dir /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/gigamidi_annotations/plots
+```
+
+---
+
 ## Quick Reference: File Structure
 
 ```
@@ -205,6 +274,9 @@ python pretrain_model/evaluate.py \
     │       ├── train_files.txt
     │       ├── val_files.txt
     │       └── test_files.txt
+    ├── gigamidi_annotations/
+    │   ├── annotations.csv  # GigaMIDI annotations (md5, emotion, emotion_prob, genre, genre_prob)
+    │   └── plots/            # Analysis plots (optional)
     └── evaluation_results/
         ├── emotion/
         │   ├── metrics.csv
@@ -284,6 +356,21 @@ python pretrain_model/evaluate.py \
     --test_files /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/test_files.txt \
     --num_classes 6 \
     --input_dim 128
+
+# 7. Annotate GigaMIDI dataset
+python annotate_gigamidi.py \
+    --emotion_model_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/checkpoints/trained_models/emotion_classifier/checkpoints/best_model.pt \
+    --genre_model_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/checkpoints/trained_models/genre_classifier/checkpoints/best_model.pt \
+    --emotion_class_to_index_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/emotion_to_index.json \
+    --genre_class_to_index_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/genre_to_index.json \
+    --input_dim 128 \
+    --emotion_num_classes 11 \
+    --genre_num_classes 6 \
+    --hidden_dim 64 \
+    --gpu \
+    --streaming \
+    --split train \
+    --resume
 ```
 
 ---
