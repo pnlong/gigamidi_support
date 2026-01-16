@@ -20,7 +20,7 @@ from utils.data_utils import XMIDI_LABELS_DIR, ensure_dir, save_json
 
 # Emotion and genre mappings
 EMOTIONS = ["exciting", "warm", "happy", "romantic", "funny", "sad", "angry", "lazy", "quiet", "fear", "magnificent"]
-GENRES = ["rock", "pop", "country", "jazz", "classical", "folk"]
+GENRES = ["rock", "pop", "country", "jazz", "classical", "traditional"]
 
 EMOTION_TO_INDEX = {emotion: i for i, emotion in enumerate(EMOTIONS)}
 GENRE_TO_INDEX = {genre: i for i, genre in enumerate(GENRES)}

@@ -160,9 +160,7 @@ def parse_args(args=None, namespace=None):
                        help="Output directory for checkpoints")
     parser.add_argument("--model_name", type=str, default=None,
                        help="Model name (default: {task}_classifier)")
-    parser.add_argument("--use_wandb", action="store_true",
-                       help="Use wandb for logging")
-    parser.add_argument("--wandb_project", type=str, default="xmidi_emotion_genre",
+    parser.add_argument("--wandb_project", type=str, default="gigamidi-support",
                        help="Wandb project name")
     parser.add_argument("--resume", action="store_true",
                        help="Resume from checkpoint")
@@ -259,13 +257,12 @@ if __name__ == "__main__":
     )
     
     # Wandb
-    if args.use_wandb:
-        run_name = f"{args.model_name}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-        wandb.init(
-            project=args.wandb_project,
-            name=run_name,
-            config=vars(args),
-        )
+    run_name = f"{args.model_name}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    wandb.init(
+        project=args.wandb_project,
+        name=run_name,
+        config=vars(args),
+    )
     
     # Setup logging
     log_file = os.path.join(args.output_dir, args.model_name, "train.log")
@@ -371,14 +368,13 @@ if __name__ == "__main__":
             pd.DataFrame([row]).to_csv(stats_file, mode="a", header=False, index=False)
         
         # Wandb logging
-        if args.use_wandb:
-            wandb.log({
-                "epoch": epoch + 1,
-                "train/loss": train_loss,
-                "valid/loss": valid_loss,
-                **{f"train/{k}": v for k, v in train_metrics.items()},
-                **{f"valid/{k}": v for k, v in valid_metrics.items()},
-            })
+        wandb.log({
+            "epoch": epoch + 1,
+            "train/loss": train_loss,
+            "valid/loss": valid_loss,
+            **{f"train/{k}": v for k, v in train_metrics.items()},
+            **{f"valid/{k}": v for k, v in valid_metrics.items()},
+        })
         
         # Save best model (based on validation accuracy)
         if valid_metrics['accuracy'] > best_accuracy:
@@ -416,5 +412,4 @@ if __name__ == "__main__":
     logging.info(f"Best validation accuracy: {best_accuracy:.4f}")
     logging.info(f"Best metrics: {best_metrics}")
     
-    if args.use_wandb:
-        wandb.finish()
+    wandb.finish()

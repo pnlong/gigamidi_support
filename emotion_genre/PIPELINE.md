@@ -65,7 +65,7 @@ This creates:
 
 **Emotion classes** (11 total): exciting, warm, happy, romantic, funny, sad, angry, lazy, quiet, fear, magnificent
 
-**Genre classes** (6 total): rock, pop, country, jazz, classical, folk
+**Genre classes** (6 total): rock, pop, country, jazz, classical, traditional
 
 ---
 
@@ -93,8 +93,7 @@ python pretrain_model/train.py \
     --num_workers 4 \
     --output_dir /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/checkpoints/trained_models \
     --model_name emotion_classifier \
-    --use_wandb \
-    --wandb_project xmidi_emotion_genre \
+    --wandb_project gigamidi-support \
     --early_stopping \
     --early_stopping_tolerance 10
 ```
@@ -121,8 +120,7 @@ python pretrain_model/train.py \
     --num_workers 4 \
     --output_dir /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/checkpoints/trained_models \
     --model_name genre_classifier \
-    --use_wandb \
-    --wandb_project xmidi_emotion_genre \
+    --wandb_project gigamidi-support \
     --early_stopping \
     --early_stopping_tolerance 10
 ```
@@ -130,7 +128,6 @@ python pretrain_model/train.py \
 **Key Arguments**:
 - `--task`: `emotion` or `genre`
 - `--resume`: Resume training from best checkpoint
-- `--use_wandb`: Enable wandb logging
 
 ---
 
@@ -252,8 +249,7 @@ python pretrain_model/train.py \
     --num_classes 11 \
     --input_dim 128 \
     --batch_size 32 \
-    --epochs 100 \
-    --use_wandb
+    --epochs 100
 
 # 5. Train genre classifier
 python pretrain_model/train.py \
@@ -266,8 +262,7 @@ python pretrain_model/train.py \
     --num_classes 6 \
     --input_dim 128 \
     --batch_size 32 \
-    --epochs 100 \
-    --use_wandb
+    --epochs 100
 
 # 6. Evaluate both models
 python pretrain_model/evaluate.py \
@@ -296,7 +291,7 @@ python pretrain_model/evaluate.py \
 ## Tips
 
 1. **Resume Processing**: Always use `--resume` flag to skip already-processed files
-2. **Monitoring**: Use `--use_wandb` during training to track metrics in real-time
+2. **Monitoring**: Wandb logging is enabled by default to track metrics in real-time
 3. **Device**: Omit `--gpu` flag to use CPU instead of GPU
 4. **Input Dimension**: MuseTok latents are 128-dimensional (d_vae_latent=128)
 5. **Mean Pooling**: The dataset automatically pools latents across bars for song-level prediction

@@ -6,7 +6,7 @@ This project implements emotion recognition (11 classes) and genre recognition (
 
 **Tasks:**
 - **Emotion Recognition**: 11 classes (exciting, warm, happy, romantic, funny, sad, angry, lazy, quiet, fear, magnificent)
-- **Genre Recognition**: 6 classes (rock, pop, country, jazz, classical, folk)
+- **Genre Recognition**: 6 classes (rock, pop, country, jazz, classical, traditional)
 
 **Architecture:**
 - MuseTok for latent extraction (shared checkpoint from valence_arousal task)

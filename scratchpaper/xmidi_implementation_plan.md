@@ -9,7 +9,7 @@ This document provides step-by-step instructions for implementing emotion recogn
 **Tasks:**
 
 1. **Emotion Recognition**: 11 classes (exciting, warm, happy, romantic, funny, sad, angry, lazy, quiet, fear, magnificent)
-2. **Genre Recognition**: 6 classes (rock, pop, country, jazz, classical, folk)
+2. **Genre Recognition**: 6 classes (rock, pop, country, jazz, classical, traditional)
 
 **Key Differences from Valence/Arousal Pipeline:**
 
@@ -150,7 +150,7 @@ EMOTIONS = ["exciting", "warm", "happy", "romantic", "funny", "sad", "angry", "l
 **Genre classes** (6 total):
 
 ```python
-GENRES = ["rock", "pop", "country", "jazz", "classical", "folk"]
+GENRES = ["rock", "pop", "country", "jazz", "classical", "traditional"]
 ```
 
 **Code structure**:
@@ -167,7 +167,7 @@ import numpy as np
 
 # Emotion and genre mappings
 EMOTIONS = ["exciting", "warm", "happy", "romantic", "funny", "sad", "angry", "lazy", "quiet", "fear", "magnificent"]
-GENRES = ["rock", "pop", "country", "jazz", "classical", "folk"]
+GENRES = ["rock", "pop", "country", "jazz", "classical", "traditional"]
 
 EMOTION_TO_INDEX = {emotion: i for i, emotion in enumerate(EMOTIONS)}
 GENRE_TO_INDEX = {genre: i for i, genre in enumerate(GENRES)}
