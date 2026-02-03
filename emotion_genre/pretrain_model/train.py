@@ -128,8 +128,10 @@ def parse_args(args=None, namespace=None):
                        help="Path to val_files.txt")
     
     # Model
-    parser.add_argument("--input_dim", type=int, default=128,
-                       help="Input dimension (d_vae_latent, default: 128)")
+    parser.add_argument("--preprocessor", choices=["musetok", "midi2vec"], default="musetok",
+                       help="Preprocessor used for latents (affects default input_dim)")
+    parser.add_argument("--input_dim", type=int, default=None,
+                       help="Input dimension (128 for MuseTok, 100 for midi2vec; overrides default)")
     parser.add_argument("--num_classes", type=int, required=True,
                        help="Number of classes (11 for emotion, 6 for genre)")
     parser.add_argument("--hidden_dim", type=int, default=None,
@@ -166,6 +168,10 @@ def parse_args(args=None, namespace=None):
                        help="Resume from checkpoint")
     
     args = parser.parse_args(args=args, namespace=namespace)
+    
+    # Set default input_dim based on preprocessor
+    if args.input_dim is None:
+        args.input_dim = 100 if args.preprocessor == "midi2vec" else 128
     
     # Set default model name
     if args.model_name is None:

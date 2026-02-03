@@ -45,8 +45,10 @@ def parse_args():
                        help="Path to class_to_index JSON file")
     parser.add_argument("--test_files", type=str, required=True,
                        help="Path to test_files.txt")
-    parser.add_argument("--input_dim", type=int, default=128,
-                       help="Input dimension")
+    parser.add_argument("--preprocessor", choices=["musetok", "midi2vec"], default="musetok",
+                       help="Preprocessor used for latents (affects default input_dim)")
+    parser.add_argument("--input_dim", type=int, default=None,
+                       help="Input dimension (128 for MuseTok, 100 for midi2vec)")
     parser.add_argument("--num_classes", type=int, required=True,
                        help="Number of classes")
     parser.add_argument("--hidden_dim", type=int, default=None,
@@ -63,6 +65,8 @@ def parse_args():
                        help="Output directory (default: EVALUATION_RESULTS_DIR/{task})")
     
     args = parser.parse_args()
+    if args.input_dim is None:
+        args.input_dim = 100 if args.preprocessor == "midi2vec" else 128
     if args.hidden_dim is None:
         args.hidden_dim = args.input_dim // 2
     if args.output_dir is None:

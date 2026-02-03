@@ -12,11 +12,18 @@ Complete step-by-step guide for training emotion recognition (11 classes) and ge
 2. **Storage directory**: Default is `/deepfreeze/pnlong/gigamidi`
    - Can be overridden with `export XMIDI_STORAGE_DIR=/path/to/storage`
 
-3. **MuseTok checkpoints**: Should be available from the valence_arousal task:
+3. **MuseTok checkpoints** (for `--preprocessor musetok`): Should be available from the valence_arousal task:
    ```
    /deepfreeze/pnlong/gigamidi/musetok/
    └── best_tokenizer.pt  (used for encoding/extracting latents)
    ```
+
+4. **Node.js** (for `--preprocessor midi2vec`): Required for midi2edgelist. Install from [nodejs.org](https://nodejs.org). Then:
+   ```bash
+   cd midi2vec/midi2edgelist && npm install
+   ```
+
+5. **midi2vec embeddings dir** (for GigaMIDI with midi2vec): Default is `/deepfreeze/pnlong/gigamidi/midi2vec`. Override with `export MIDI2VEC_EMBEDDINGS_DIR=/path/to/midi2vec`.
 
 ---
 
@@ -32,19 +39,36 @@ python pretrain_model/download_xmidi.py \
 
 **Note**: After download, extract the zip file. The dataset should contain MIDI files with naming format: `XMIDI_<Emotion>_<Genre>_<ID_len_8>.midi`
 
-### 1.2 Extract Latents from XMIDI
+### 1.2 Extract Latents/Embeddings from XMIDI
+
+Two preprocessors are supported: **MuseTok** (per-bar latents, 128d) and **midi2vec** (per-song embeddings, 100d).
+
+#### Option A: MuseTok (default)
 
 ```bash
 python pretrain_model/preprocess_xmidi.py \
+    --preprocessor musetok \
     --xmidi_dir /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data \
     --output_dir /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/latents \
     --gpu \
     --resume
 ```
 
-**Key Arguments**:
-- `--resume`: Skip already-processed files
-- `--gpu`: Use GPU for faster processing
+**Key Arguments**: `--resume`, `--gpu`, `--batch_size`, `--num_workers`
+
+#### Option B: midi2vec
+
+```bash
+python pretrain_model/preprocess_xmidi.py \
+    --preprocessor midi2vec \
+    --xmidi_dir /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data \
+    --output_dir /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/latents \
+    --resume
+```
+
+Runs midi2edgelist (Node.js) and edgelist2vec (Python) on the XMIDI directory. Output is compatible with the same dataset/training pipeline. Use `--input_dim 100` when training with midi2vec.
+
+**Precomputed**: If you already have `embeddings.bin` and `names.csv` for XMIDI, place them in `$MIDI2VEC_EMBEDDINGS_DIR` and add `--precomputed /path/to/dir` to skip the pipeline.
 
 ### 1.3 Prepare Labels and Create Splits
 
@@ -184,8 +208,11 @@ After training and evaluating the emotion and genre classifiers, use them to ann
 
 ### 4.1 Annotate GigaMIDI with Emotion and Genre Predictions
 
+#### Option A: MuseTok (on-the-fly extraction)
+
 ```bash
 python annotate_gigamidi.py \
+    --preprocessor musetok \
     --emotion_model_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/checkpoints/trained_models/emotion_classifier/checkpoints/best_model.pt \
     --genre_model_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/checkpoints/trained_models/genre_classifier/checkpoints/best_model.pt \
     --emotion_class_to_index_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/emotion_to_index.json \
@@ -220,12 +247,47 @@ python annotate_gigamidi.py \
 - `genre_prob`: Confidence/probability for genre prediction (0-1)
 
 **Note**: 
-- The script processes songs one at a time, extracting latents on-the-fly
+- MuseTok: processes songs one at a time, extracting latents on-the-fly
 - Mean pooling is applied across bars to get song-level predictions
 - Progress is saved incrementally (one row per song) to avoid losing work
 - Use `--resume` to continue from where you left off if interrupted
 
-### 4.2 Analyze Annotations (Optional)
+#### Option B: midi2vec (precomputed embeddings)
+
+Requires precomputed GigaMIDI embeddings. Run `export_gigamidi_for_midi2vec.py` first (see below).
+
+```bash
+python annotate_gigamidi.py \
+    --preprocessor midi2vec \
+    --embeddings_dir /deepfreeze/pnlong/gigamidi/midi2vec \
+    --emotion_model_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/checkpoints/trained_models/emotion_classifier/checkpoints/best_model.pt \
+    --genre_model_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/checkpoints/trained_models/genre_classifier/checkpoints/best_model.pt \
+    --emotion_class_to_index_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/emotion_to_index.json \
+    --genre_class_to_index_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/genre_to_index.json \
+    --input_dim 100 \
+    --emotion_num_classes 11 \
+    --genre_num_classes 6 \
+    --streaming \
+    --split train \
+    --resume \
+    --output_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/gigamidi_annotations/annotations.csv
+```
+
+**Precomputed embeddings**: Run `export_gigamidi_for_midi2vec.py` to export GigaMIDI to disk and run midi2vec pipeline. This produces `embeddings.bin` and `names.csv` in the output dir. Songs not in the lookup are skipped.
+
+### 4.2 Export GigaMIDI for midi2vec (one-time, for Option B above)
+
+```bash
+python export_gigamidi_for_midi2vec.py \
+    --output_dir /deepfreeze/pnlong/gigamidi/midi2vec \
+    --split train \
+    --streaming \
+    --max_samples 10000
+```
+
+Omit `--max_samples` for full dataset. Use `--skip_export` to re-run midi2vec on an existing export.
+
+### 4.3 Analyze Annotations (Optional)
 
 After annotation, you can analyze the distribution of predictions:
 
@@ -253,6 +315,10 @@ python analyze_annotations/plot_by_genre.py \
 /deepfreeze/pnlong/gigamidi/
 ├── musetok/
 │   └── best_tokenizer.pt  (shared MuseTok checkpoint)
+├── midi2vec/               # midi2vec precomputed embeddings (optional)
+│   ├── embeddings.bin
+│   ├── names.csv
+│   └── gigamidi_midis/    # Exported GigaMIDI as {md5}.mid
 └── xmidi_emotion_genre/
     ├── checkpoints/
     │   └── trained_models/
@@ -359,6 +425,7 @@ python pretrain_model/evaluate.py \
 
 # 7. Annotate GigaMIDI dataset
 python annotate_gigamidi.py \
+    --preprocessor musetok \
     --emotion_model_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/checkpoints/trained_models/emotion_classifier/checkpoints/best_model.pt \
     --genre_model_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/checkpoints/trained_models/genre_classifier/checkpoints/best_model.pt \
     --emotion_class_to_index_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/emotion_to_index.json \
@@ -373,6 +440,67 @@ python annotate_gigamidi.py \
     --resume
 ```
 
+### Workflow 2: Complete Pipeline with midi2vec
+
+```bash
+# 1. Download and extract XMIDI dataset
+python pretrain_model/download_xmidi.py
+
+# 2. Preprocess XMIDI with midi2vec
+python pretrain_model/preprocess_xmidi.py \
+    --preprocessor midi2vec \
+    --xmidi_dir /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data \
+    --output_dir /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/latents \
+    --resume
+
+# 3. Prepare labels and splits
+python pretrain_model/prepare_labels.py \
+    --xmidi_dir /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data \
+    --output_dir /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels
+
+# 4. Train emotion classifier (--preprocessor midi2vec sets input_dim=100)
+python pretrain_model/train.py \
+    --task emotion \
+    --preprocessor midi2vec \
+    --latents_dir /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/latents \
+    --labels_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/emotion_labels.json \
+    --class_to_index_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/emotion_to_index.json \
+    --train_files /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/train_files.txt \
+    --valid_files /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/val_files.txt \
+    --num_classes 11 \
+    --batch_size 32 \
+    --epochs 100
+
+# 5. Train genre classifier
+python pretrain_model/train.py \
+    --task genre \
+    --preprocessor midi2vec \
+    --latents_dir /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/latents \
+    --labels_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/genre_labels.json \
+    --class_to_index_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/genre_to_index.json \
+    --train_files /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/train_files.txt \
+    --valid_files /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/val_files.txt \
+    --num_classes 6 \
+    --batch_size 32 \
+    --epochs 100
+
+# 6. Evaluate both models
+python pretrain_model/evaluate.py --task emotion --preprocessor midi2vec ...
+python pretrain_model/evaluate.py --task genre --preprocessor midi2vec ...
+
+# 7. Export GigaMIDI for midi2vec (one-time)
+python export_gigamidi_for_midi2vec.py --output_dir /deepfreeze/pnlong/gigamidi/midi2vec --split train
+
+# 8. Annotate GigaMIDI with midi2vec
+python annotate_gigamidi.py \
+    --preprocessor midi2vec \
+    --embeddings_dir /deepfreeze/pnlong/gigamidi/midi2vec \
+    --emotion_model_path ... \
+    --genre_model_path ... \
+    --input_dim 100 \
+    --streaming --split train --resume
+```
+
 ---
 
 ## Tips
@@ -380,16 +508,19 @@ python annotate_gigamidi.py \
 1. **Resume Processing**: Always use `--resume` flag to skip already-processed files
 2. **Monitoring**: Wandb logging is enabled by default to track metrics in real-time
 3. **Device**: Omit `--gpu` flag to use CPU instead of GPU
-4. **Input Dimension**: MuseTok latents are 128-dimensional (d_vae_latent=128)
+4. **Input Dimension**: MuseTok latents are 128-dimensional; midi2vec embeddings are 100-dimensional. Use `--preprocessor midi2vec` (or `--input_dim 100`) when training/evaluating with midi2vec.
 5. **Mean Pooling**: The dataset automatically pools latents across bars for song-level prediction
 6. **Stratified Splits**: The prepare_labels script creates stratified splits to maintain class distribution
+7. **midi2vec is transductive**: Embeddings exist only for files that were in the graph when node2vec ran. No pretrained model for new files. Run the pipeline on your corpus.
 
 ---
 
 ## Troubleshooting
 
 - **Out of Memory**: Reduce `--batch_size` in training/evaluation scripts
-- **Checkpoint Not Found**: Verify MuseTok checkpoint is available from valence_arousal task
+- **Checkpoint Not Found**: Verify MuseTok checkpoint is available from valence_arousal task (musetok only)
 - **File Not Found**: Check that XMIDI directories exist and paths are correct
 - **Class Imbalance**: Check confusion matrix to see if certain classes are underrepresented
 - **Low Accuracy**: Try adjusting learning rate, hidden dimension, or dropout rate
+- **midi2edgelist failed**: Ensure Node.js is installed and `cd midi2vec/midi2edgelist && npm install` has been run
+- **md5 not in embeddings**: For midi2vec GigaMIDI annotation, ensure export_gigamidi_for_midi2vec.py was run on the same split. Songs not in the export are skipped.

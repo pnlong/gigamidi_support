@@ -1,0 +1,12 @@
+# midi2vec configuration
+# Used when --preprocessor midi2vec
+
+dimensions: 100  # Embedding dimension (must match input_dim for training)
+
+# node2vec parameters (passed to edgelist2vec)
+walk_length: 10
+num_walks: 40
+p: 1.0
+q: 1.0
+window_size: 5
+iter: 5

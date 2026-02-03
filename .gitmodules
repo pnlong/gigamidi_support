@@ -4,3 +4,6 @@
 [submodule "musetok"]
 	path = musetok
 	url = https://github.com/Yuer867/MuseTok
+[submodule "midi2vec"]
+	path = midi2vec
+	url = https://github.com/midi-ld/midi2vec

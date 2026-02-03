@@ -33,6 +33,12 @@ EVALUATION_RESULTS_DIR = os.path.join(XMIDI_EMOTION_GENRE_DIR, "evaluation_resul
 MUSETOK_CHECKPOINT_DIR = os.path.join(STORAGE_DIR, "musetok")
 MUSETOK_TOKENIZER_CHECKPOINT = os.path.join(MUSETOK_CHECKPOINT_DIR, "best_tokenizer.pt")
 
+# midi2vec precomputed embeddings (embeddings.bin, names.csv)
+MIDI2VEC_EMBEDDINGS_DIR = os.environ.get(
+    "MIDI2VEC_EMBEDDINGS_DIR",
+    os.path.join(STORAGE_DIR, "midi2vec")
+)
+
 def get_storage_dir() -> str:
     """Get the base storage directory."""
     return STORAGE_DIR
@@ -45,7 +51,7 @@ def set_storage_dir(path: str) -> None:
     """Set the storage directory (call before other operations)."""
     global STORAGE_DIR, XMIDI_EMOTION_GENRE_DIR
     global CHECKPOINTS_DIR, XMIDI_DATA_DIR, XMIDI_LATENTS_DIR, XMIDI_LABELS_DIR
-    global TRAINED_MODEL_DIR, EVALUATION_RESULTS_DIR
+    global TRAINED_MODEL_DIR, EVALUATION_RESULTS_DIR, MIDI2VEC_EMBEDDINGS_DIR
     
     STORAGE_DIR = path
     XMIDI_EMOTION_GENRE_DIR = os.path.join(STORAGE_DIR, "xmidi_emotion_genre")
@@ -55,6 +61,7 @@ def set_storage_dir(path: str) -> None:
     XMIDI_LABELS_DIR = os.path.join(XMIDI_DATA_DIR, "labels")
     TRAINED_MODEL_DIR = os.path.join(CHECKPOINTS_DIR, "trained_models")
     EVALUATION_RESULTS_DIR = os.path.join(XMIDI_EMOTION_GENRE_DIR, "evaluation_results")
+    MIDI2VEC_EMBEDDINGS_DIR = os.path.join(STORAGE_DIR, "midi2vec")
 
 # ================================================== #
 #  File I/O Utilities                               #

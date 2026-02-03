@@ -11,3 +11,8 @@ wandb>=0.15.0
 matplotlib>=3.7.0
 seaborn>=0.12.0
 scikit-learn>=1.3.0
+
+# midi2vec (optional, for --preprocessor midi2vec)
+nodevectors
+networkx>=2.8
+gensim>=4.0

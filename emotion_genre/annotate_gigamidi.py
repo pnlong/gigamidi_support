@@ -21,9 +21,10 @@ from datasets import load_dataset
 sys.path.insert(0, dirname(dirname(realpath(__file__))))
 
 from utils.musetok_utils import load_musetok_model, extract_latents_from_midi
+from utils.midi2vec_utils import load_embeddings_lookup
 from pretrain_model.model import EmotionGenreClassifier
 from utils.data_utils import (
-    TRAINED_MODEL_DIR, MUSETOK_CHECKPOINT_DIR,
+    TRAINED_MODEL_DIR, MUSETOK_CHECKPOINT_DIR, MIDI2VEC_EMBEDDINGS_DIR,
     ensure_dir, load_json
 )
 
@@ -38,12 +39,16 @@ def parse_args():
                        help="Path to emotion_to_index.json")
     parser.add_argument("--genre_class_to_index_path", type=str, required=True,
                        help="Path to genre_to_index.json")
+    parser.add_argument("--preprocessor", choices=["musetok", "midi2vec"], default="musetok",
+                       help="Preprocessor: musetok (on-the-fly) or midi2vec (precomputed lookup)")
     parser.add_argument("--checkpoint_path", type=str, default=None,
-                       help="Path to MuseTok checkpoint (defaults to MUSETOK_CHECKPOINT_DIR/best_tokenizer.pt)")
+                       help="Path to MuseTok checkpoint (musetok only)")
     parser.add_argument("--vocab_path", type=str, default=None,
-                       help="Path to MuseTok vocabulary")
-    parser.add_argument("--input_dim", type=int, default=128,
-                       help="Input dimension for model (should match latent dim)")
+                       help="Path to MuseTok vocabulary (musetok only)")
+    parser.add_argument("--embeddings_dir", type=str, default=None,
+                       help="Path to midi2vec dir with embeddings.bin and names.csv (midi2vec only)")
+    parser.add_argument("--input_dim", type=int, default=None,
+                       help="Input dimension (128 for MuseTok, 100 for midi2vec)")
     parser.add_argument("--emotion_num_classes", type=int, default=11,
                        help="Number of emotion classes")
     parser.add_argument("--genre_num_classes", type=int, default=6,
@@ -68,8 +73,12 @@ def parse_args():
                        help="Prefer velocity vocabulary for MuseTok")
     
     args = parser.parse_args()
+    if args.input_dim is None:
+        args.input_dim = 100 if args.preprocessor == "midi2vec" else 128
     if args.hidden_dim is None:
         args.hidden_dim = args.input_dim // 2
+    if args.embeddings_dir is None and args.preprocessor == "midi2vec":
+        args.embeddings_dir = MIDI2VEC_EMBEDDINGS_DIR
     return args
 
 def load_existing_annotations(csv_path):
@@ -146,6 +155,52 @@ def process_song(sample, emotion_model, genre_model, musetok_model, vocab, devic
         logging.warning(f"Error processing song {sample.get('md5', 'unknown')}: {e}")
         return None
 
+
+def process_song_midi2vec(sample, emotion_model, genre_model, embeddings_lookup, device,
+                          emotion_index_to_class, genre_index_to_class):
+    """
+    Process a single song using precomputed midi2vec embeddings.
+    
+    Returns:
+        dict with 'md5', 'emotion', 'emotion_prob', 'genre', 'genre_prob' or None if md5 not in lookup
+    """
+    try:
+        md5 = sample.get("md5", "")
+        if not md5:
+            logging.warning("Sample missing md5, skipping")
+            return None
+        
+        if md5 not in embeddings_lookup:
+            logging.debug(f"md5 {md5} not in precomputed embeddings, skipping")
+            return None
+        
+        embedding = embeddings_lookup[md5]
+        latents_pooled = torch.from_numpy(embedding).float().unsqueeze(0).to(device)  # (1, dim)
+        
+        with torch.no_grad():
+            emotion_logits = emotion_model(latents_pooled)
+            genre_logits = genre_model(latents_pooled)
+            emotion_probs = F.softmax(emotion_logits, dim=1)
+            genre_probs = F.softmax(genre_logits, dim=1)
+            emotion_pred_idx = torch.argmax(emotion_logits, dim=1).item()
+            genre_pred_idx = torch.argmax(genre_logits, dim=1).item()
+            emotion_pred = emotion_index_to_class[emotion_pred_idx]
+            genre_pred = genre_index_to_class[genre_pred_idx]
+            emotion_prob = float(emotion_probs[0, emotion_pred_idx].item())
+            genre_prob = float(genre_probs[0, genre_pred_idx].item())
+        
+        return {
+            "md5": md5,
+            "emotion": emotion_pred,
+            "emotion_prob": emotion_prob,
+            "genre": genre_pred,
+            "genre_prob": genre_prob,
+        }
+    except Exception as e:
+        logging.warning(f"Error processing song {sample.get('md5', 'unknown')}: {e}")
+        return None
+
+
 if __name__ == "__main__":
     args = parse_args()
     device = torch.device("cuda" if args.gpu and torch.cuda.is_available() else "cpu")
@@ -204,15 +259,30 @@ if __name__ == "__main__":
     genre_model.load_state_dict(torch.load(args.genre_model_path, map_location=device))
     genre_model.eval()
     
-    # Load MuseTok model
-    logging.info("Loading MuseTok model...")
-    musetok_model, vocab, use_velocity = load_musetok_model(
-        checkpoint_path=args.checkpoint_path,
-        vocab_path=args.vocab_path,
-        use_gpu=args.gpu,
-        prefer_velocity=args.velocity,
-    )
-    logging.info(f"MuseTok model loaded successfully (velocity support: {use_velocity})")
+    musetok_model = None
+    vocab = None
+    embeddings_lookup = None
+    
+    if args.preprocessor == "musetok":
+        logging.info("Loading MuseTok model...")
+        musetok_model, vocab, use_velocity = load_musetok_model(
+            checkpoint_path=args.checkpoint_path,
+            vocab_path=args.vocab_path,
+            use_gpu=args.gpu,
+            prefer_velocity=args.velocity,
+        )
+        logging.info(f"MuseTok model loaded successfully (velocity support: {use_velocity})")
+    else:
+        logging.info(f"Loading midi2vec embeddings from {args.embeddings_dir}...")
+        embeddings_bin = os.path.join(args.embeddings_dir, "embeddings.bin")
+        names_csv = os.path.join(args.embeddings_dir, "names.csv")
+        if not os.path.isfile(embeddings_bin) or not os.path.isfile(names_csv):
+            raise FileNotFoundError(
+                f"midi2vec requires embeddings.bin and names.csv in {args.embeddings_dir}. "
+                "Run export_gigamidi_for_midi2vec.py first."
+            )
+        embeddings_lookup = load_embeddings_lookup(embeddings_bin, names_csv)
+        logging.info(f"Loaded {len(embeddings_lookup)} precomputed embeddings")
     
     # Load GigaMIDI dataset
     logging.info(f"Loading GigaMIDI dataset (split={args.split}, streaming={args.streaming})...")
@@ -248,10 +318,16 @@ if __name__ == "__main__":
                 continue
             
             # Process song (returns dict with predictions)
-            result = process_song(
-                sample, emotion_model, genre_model, musetok_model, vocab, device,
-                emotion_index_to_class, genre_index_to_class
-            )
+            if args.preprocessor == "musetok":
+                result = process_song(
+                    sample, emotion_model, genre_model, musetok_model, vocab, device,
+                    emotion_index_to_class, genre_index_to_class
+                )
+            else:
+                result = process_song_midi2vec(
+                    sample, emotion_model, genre_model, embeddings_lookup, device,
+                    emotion_index_to_class, genre_index_to_class
+                )
             
             if result is not None:
                 # Write to CSV
