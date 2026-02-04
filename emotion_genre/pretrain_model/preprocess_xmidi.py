@@ -53,6 +53,8 @@ def main():
     # Common
     parser.add_argument("--resume", action="store_true",
                         help="Resume: skip already-processed files")
+    parser.add_argument("--no_show_progress", action="store_true", dest="no_show_progress",
+                        help="Suppress progress output from midi2edgelist/edgelist2vec (midi2vec only)")
     
     args = parser.parse_args()
     
@@ -76,6 +78,7 @@ def main():
             precomputed_dir=args.precomputed,
             dimensions=args.dimensions,
             resume=args.resume,
+            show_progress=not args.no_show_progress,
         )
 
 

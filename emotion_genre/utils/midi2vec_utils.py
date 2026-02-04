@@ -12,6 +12,7 @@ import logging
 from pathlib import Path
 from typing import Dict, Optional, Callable
 import numpy as np
+from tqdm import tqdm
 
 # Resolve path to midi2vec (sibling of emotion_genre in gigamidi)
 _EMOTION_GENRE_DIR = Path(__file__).resolve().parent.parent
@@ -19,13 +20,23 @@ _GIGAMIDI_ROOT = _EMOTION_GENRE_DIR.parent
 MIDI2VEC_ROOT = _GIGAMIDI_ROOT / "midi2vec"
 
 
-def run_midi2edgelist(midi_dir: str, output_dir: str) -> bool:
+def _count_midi_files(midi_dir: str) -> int:
+    """Count MIDI files in directory (matches midi2edgelist's klawSync filter)."""
+    seen = set()
+    for p in Path(midi_dir).rglob("*"):
+        if p.is_file() and p.suffix.lower() in (".mid", ".midi"):
+            seen.add(p.resolve())
+    return len(seen)
+
+
+def run_midi2edgelist(midi_dir: str, output_dir: str, show_progress: bool = True) -> bool:
     """
     Run midi2edgelist (Node.js) to convert MIDI files to graph edgelists.
     
     Args:
         midi_dir: Directory containing MIDI files
         output_dir: Output directory for edgelists and names.csv
+        show_progress: If True, show a progress bar (one tick per file) instead of raw output
         
     Returns:
         True if successful, False otherwise
@@ -43,10 +54,33 @@ def run_midi2edgelist(midi_dir: str, output_dir: str) -> bool:
     ]
     logging.info(f"Running midi2edgelist: {' '.join(cmd)}")
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(MIDI2VEC_ROOT / "midi2edgelist"))
-        if result.returncode != 0:
-            logging.error(f"midi2edgelist failed: {result.stderr}")
-            return False
+        if show_progress:
+            num_files = _count_midi_files(midi_dir)
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                cwd=str(MIDI2VEC_ROOT / "midi2edgelist"),
+            )
+            with tqdm(total=num_files, desc="midi2edgelist", unit="file") as pbar:
+                for line in proc.stdout:
+                    line = line.rstrip()
+                    if line:
+                        if ".mid" in line.lower() or ".midi" in line.lower():
+                            pbar.update(1)
+                        elif "error" in line.lower() or "exception" in line.lower():
+                            logging.warning(line)
+            proc.wait()
+            if proc.returncode != 0:
+                logging.error("midi2edgelist failed (run with --no_show_progress to see full output)")
+                return False
+        else:
+            result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(MIDI2VEC_ROOT / "midi2edgelist"))
+            if result.returncode != 0:
+                err = result.stderr if result.stderr else "(see stderr above)"
+                logging.error(f"midi2edgelist failed: {err}")
+                return False
         return True
     except FileNotFoundError:
         logging.error("Node.js not found. Install Node.js to run midi2edgelist.")
@@ -57,6 +91,7 @@ def run_edgelist2vec(
     edgelist_dir: str,
     output_bin: str,
     dimensions: int = 100,
+    show_progress: bool = True,
 ) -> bool:
     """
     Run edgelist2vec (Python) to compute node2vec embeddings.
@@ -65,6 +100,7 @@ def run_edgelist2vec(
         edgelist_dir: Directory containing .edgelist files and names.csv
         output_bin: Path to output embeddings.bin (gensim KeyedVectors)
         dimensions: Embedding dimension (default 100)
+        show_progress: If True, stream stdout/stderr to terminal (shows node2vec verbose output)
         
     Returns:
         True if successful, False otherwise
@@ -83,9 +119,10 @@ def run_edgelist2vec(
     ]
     logging.info(f"Running edgelist2vec: {' '.join(cmd)}")
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=not show_progress, text=True)
         if result.returncode != 0:
-            logging.error(f"edgelist2vec failed: {result.stderr}")
+            err = result.stderr if result.stderr else "(see stderr above)"
+            logging.error(f"edgelist2vec failed: {err}")
             return False
         return True
     except FileNotFoundError:
