@@ -50,11 +50,10 @@ python pretrain_model/preprocess_xmidi.py \
     --preprocessor musetok \
     --xmidi_dir /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data \
     --output_dir /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/latents \
-    --gpu \
-    --resume
+    --gpu
 ```
 
-**Key Arguments**: `--resume`, `--gpu`, `--batch_size`, `--num_workers`
+**Key Arguments**: `--gpu`, `--batch_size`, `--num_workers`. Resume is default; use `--reset` to recompute from scratch.
 
 #### Option B: midi2vec
 
@@ -62,11 +61,12 @@ python pretrain_model/preprocess_xmidi.py \
 python pretrain_model/preprocess_xmidi.py \
     --preprocessor midi2vec \
     --xmidi_dir /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data \
-    --output_dir /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/latents \
-    --resume
+    --output_dir /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/latents
 ```
 
 Runs midi2edgelist (Node.js) and edgelist2vec (Python) on the XMIDI directory. Output is compatible with the same dataset/training pipeline. Use `--input_dim 100` when training with midi2vec.
+
+**Key Arguments**: `--workers 1` (default) uses a single core. Use `--workers 0` to use all CPU cores, or `--workers N` for N parallel processes. Resume is default; use `--reset` to recompute from scratch. If you stop after midi2edgelist, re-running skips it and continues from edgelist2vec.
 
 **Precomputed**: If you already have `embeddings.bin` and `names.csv` for XMIDI, place them in `$MIDI2VEC_EMBEDDINGS_DIR` and add `--precomputed /path/to/dir` to skip the pipeline.
 
@@ -285,7 +285,7 @@ python export_gigamidi_for_midi2vec.py \
     --max_samples 10000
 ```
 
-Omit `--max_samples` for full dataset. Use `--skip_export` to re-run midi2vec on an existing export.
+Omit `--max_samples` for full dataset. Use `--skip_export` to re-run midi2vec on an existing export. `--workers 1` (default) uses a single core; use `--workers 0` for all CPU cores. If you stop after midi2edgelist, re-running the script skips it and continues from edgelist2vec.
 
 ### 4.3 Analyze Annotations (Optional)
 
@@ -368,8 +368,7 @@ python pretrain_model/download_xmidi.py
 python pretrain_model/preprocess_xmidi.py \
     --xmidi_dir /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data \
     --output_dir /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/latents \
-    --gpu \
-    --resume
+    --gpu
 
 # 3. Prepare labels and splits
 python pretrain_model/prepare_labels.py \
@@ -450,8 +449,7 @@ python pretrain_model/download_xmidi.py
 python pretrain_model/preprocess_xmidi.py \
     --preprocessor midi2vec \
     --xmidi_dir /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data \
-    --output_dir /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/latents \
-    --resume
+    --output_dir /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/latents
 
 # 3. Prepare labels and splits
 python pretrain_model/prepare_labels.py \
@@ -489,7 +487,9 @@ python pretrain_model/evaluate.py --task emotion --preprocessor midi2vec ...
 python pretrain_model/evaluate.py --task genre --preprocessor midi2vec ...
 
 # 7. Export GigaMIDI for midi2vec (one-time)
-python export_gigamidi_for_midi2vec.py --output_dir /deepfreeze/pnlong/gigamidi/midi2vec --split train
+python export_gigamidi_for_midi2vec.py \
+    --output_dir /deepfreeze/pnlong/gigamidi/midi2vec \
+    --split train
 
 # 8. Annotate GigaMIDI with midi2vec
 python annotate_gigamidi.py \
@@ -505,13 +505,13 @@ python annotate_gigamidi.py \
 
 ## Tips
 
-1. **Resume Processing**: Always use `--resume` flag to skip already-processed files
+1. **Resume Processing**: Preprocessing resumes by default (skips existing output). Use `--reset` to recompute from scratch.
 2. **Monitoring**: Wandb logging is enabled by default to track metrics in real-time
 3. **Device**: Omit `--gpu` flag to use CPU instead of GPU
 4. **Input Dimension**: MuseTok latents are 128-dimensional; midi2vec embeddings are 100-dimensional. Use `--preprocessor midi2vec` (or `--input_dim 100`) when training/evaluating with midi2vec.
 5. **Mean Pooling**: The dataset automatically pools latents across bars for song-level prediction
-6. **Stratified Splits**: The prepare_labels script creates stratified splits to maintain class distribution
-7. **midi2vec is transductive**: Embeddings exist only for files that were in the graph when node2vec ran. No pretrained model for new files. Run the pipeline on your corpus.
+7. **Stratified Splits**: The prepare_labels script creates stratified splits to maintain class distribution
+8. **midi2vec is transductive**: Embeddings exist only for files that were in the graph when node2vec ran. No pretrained model for new files. Run the pipeline on your corpus.
 
 ---
 

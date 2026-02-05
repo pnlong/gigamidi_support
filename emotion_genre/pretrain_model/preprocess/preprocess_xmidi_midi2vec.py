@@ -52,6 +52,7 @@ def preprocess_xmidi_midi2vec(
     dimensions: int = 100,
     resume: bool = False,
     show_progress: bool = True,
+    workers: int = 0,
 ):
     """
     Preprocess XMIDI with midi2vec.
@@ -67,6 +68,7 @@ def preprocess_xmidi_midi2vec(
         dimensions: Embedding dimension (default 100)
         resume: If True, skip if all expected files already exist in output_dir
         show_progress: If True, stream midi2edgelist/edgelist2vec output to terminal
+        workers: Number of parallel workers for midi2edgelist and edgelist2vec (1 = single core; 0 = use all CPUs)
     """
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     
@@ -98,14 +100,19 @@ def preprocess_xmidi_midi2vec(
     edgelist_dir = os.path.join(precomputed_dir, "edgelist")
     ensure_dir(edgelist_dir)
     
-    # Step 1: midi2edgelist
-    if not run_midi2edgelist(xmidi_dir, edgelist_dir, show_progress=show_progress):
-        logging.error("midi2edgelist failed. Aborting.")
-        return
+    # Step 1: midi2edgelist (skip if edgelist output exists and resuming)
+    names_csv_path = os.path.join(edgelist_dir, "names.csv")
+    edgelist_done = os.path.isfile(names_csv_path)
+    if edgelist_done and resume:
+        logging.info(f"Edgelist output already exists at {edgelist_dir}, skipping midi2edgelist")
+    else:
+        if not run_midi2edgelist(xmidi_dir, edgelist_dir, show_progress=show_progress, workers=workers):
+            logging.error("midi2edgelist failed. Aborting.")
+            return
     
     # Step 2: edgelist2vec
     embeddings_output = os.path.join(precomputed_dir, "embeddings.bin")
-    if not run_edgelist2vec(edgelist_dir, embeddings_output, dimensions=dimensions, show_progress=show_progress):
+    if not run_edgelist2vec(edgelist_dir, embeddings_output, dimensions=dimensions, show_progress=show_progress, workers=workers):
         logging.error("edgelist2vec failed. Aborting.")
         return
     
@@ -147,15 +154,19 @@ if __name__ == "__main__":
     parser.add_argument("--precomputed", default=None,
                         help="Path to dir with embeddings.bin and names.csv (optional)")
     parser.add_argument("--dimensions", type=int, default=100, help="Embedding dimension")
-    parser.add_argument("--resume", action="store_true", help="Skip if output already complete")
+    parser.add_argument("--reset", action="store_true",
+                        help="Reset: recompute everything (default: resume, skip existing output)")
     parser.add_argument("--no_show_progress", action="store_true",
                         help="Suppress progress output from midi2edgelist/edgelist2vec")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Parallel workers for midi2edgelist and edgelist2vec (1 = single core; 0 = use all CPUs)")
     args = parser.parse_args()
     
     preprocess_xmidi_midi2vec(
         args.xmidi_dir, args.output_dir,
         precomputed_dir=args.precomputed,
         dimensions=args.dimensions,
-        resume=args.resume,
+        resume=not args.reset,
         show_progress=not args.no_show_progress,
+        workers=args.workers,
     )

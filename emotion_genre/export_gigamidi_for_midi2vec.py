@@ -40,6 +40,8 @@ def main():
                         help="Skip export; only run midi2vec on existing midi_dir")
     parser.add_argument("--midi_dir", default=None,
                         help="Existing dir with {md5}.mid files (for --skip_export)")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Parallel workers for midi2edgelist and edgelist2vec (1 = single core; 0 = use all CPUs)")
     args = parser.parse_args()
     
     output_dir = args.output_dir or MIDI2VEC_EMBEDDINGS_DIR
@@ -89,16 +91,21 @@ def main():
             raise FileNotFoundError(f"midi_dir not found: {midi_dir}")
     
     # Run midi2vec pipeline
-    logging.info("Running midi2edgelist...")
     edgelist_dir = os.path.join(output_dir, "edgelist")
     ensure_dir(edgelist_dir)
-    if not run_midi2edgelist(midi_dir, edgelist_dir):
-        logging.error("midi2edgelist failed")
-        sys.exit(1)
+    names_csv_path = os.path.join(edgelist_dir, "names.csv")
+    edgelist_done = os.path.isfile(names_csv_path)
+    if edgelist_done:
+        logging.info(f"Edgelist output already exists at {edgelist_dir}, skipping midi2edgelist")
+    else:
+        logging.info("Running midi2edgelist...")
+        if not run_midi2edgelist(midi_dir, edgelist_dir, workers=args.workers):
+            logging.error("midi2edgelist failed")
+            sys.exit(1)
     
     logging.info("Running edgelist2vec...")
     embeddings_bin = os.path.join(output_dir, "embeddings.bin")
-    if not run_edgelist2vec(edgelist_dir, embeddings_bin, dimensions=args.dimensions):
+    if not run_edgelist2vec(edgelist_dir, embeddings_bin, dimensions=args.dimensions, workers=args.workers):
         logging.error("edgelist2vec failed")
         sys.exit(1)
     

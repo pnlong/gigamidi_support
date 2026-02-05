@@ -49,10 +49,12 @@ def main():
                         help="Path to dir with embeddings.bin and names.csv (midi2vec only)")
     parser.add_argument("--dimensions", type=int, default=100,
                         help="Embedding dimension (midi2vec only)")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Parallel workers for midi2edgelist and edgelist2vec (1 = single core; 0 = use all CPUs, midi2vec only)")
     
     # Common
-    parser.add_argument("--resume", action="store_true",
-                        help="Resume: skip already-processed files")
+    parser.add_argument("--reset", action="store_true",
+                        help="Reset: recompute everything (default: resume, skip existing output)")
     parser.add_argument("--no_show_progress", action="store_true", dest="no_show_progress",
                         help="Suppress progress output from midi2edgelist/edgelist2vec (midi2vec only)")
     
@@ -66,7 +68,7 @@ def main():
             checkpoint_path=args.checkpoint_path,
             vocab_path=args.vocab_path,
             use_gpu=args.gpu,
-            resume=args.resume,
+            resume=not args.reset,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
         )
@@ -77,8 +79,9 @@ def main():
             output_dir=args.output_dir,
             precomputed_dir=args.precomputed,
             dimensions=args.dimensions,
-            resume=args.resume,
+            resume=not args.reset,
             show_progress=not args.no_show_progress,
+            workers=args.workers,
         )
 
 
