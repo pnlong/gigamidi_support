@@ -114,4 +114,4 @@ dependencies:
     - xxhash==3.6.0
     - yarl==1.22.0
 
-prefix: "/home/pnlong/micromamba/envs/gigamidi"
+prefix: "/data3/pnlong/micromamba/envs/gigamidi"
