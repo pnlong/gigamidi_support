@@ -50,7 +50,7 @@ def main():
     parser.add_argument("--dimensions", type=int, default=100,
                         help="Embedding dimension (midi2vec only)")
     parser.add_argument("--workers", type=int, default=1,
-                        help="Parallel workers for midi2edgelist and edgelist2vec (1 = single core, slow; 0 = use all CPUs, midi2vec only)")
+                        help="midi2vec: parallel workers (non-batched) or batches to run in parallel (batched; each batch=1 core). 0 = use all CPUs (midi2vec only)")
     parser.add_argument("--midi2vec_num_batches", type=int, default=20,
                         help="If set, use batched midi2vec with this many batches (stratified by emotion+genre); output in MIDI2VEC_BATCHES_DIR (midi2vec only)")
     
@@ -85,7 +85,7 @@ def main():
                 dimensions=args.dimensions,
                 reset=args.reset,
                 show_progress=not args.no_show_progress,
-                edgelist2vec_workers=args.workers,
+                num_workers=args.workers if args.workers else None,
             )
         else:
             from pretrain_model.preprocess.preprocess_xmidi_midi2vec import preprocess_xmidi_midi2vec

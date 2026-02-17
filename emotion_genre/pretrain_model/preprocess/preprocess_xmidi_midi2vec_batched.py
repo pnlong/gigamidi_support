@@ -227,8 +227,8 @@ def _compute_and_log_batch_label_statistics(
 
 def _run_one_batch(args: tuple) -> tuple[int, bool]:
     """
-    Worker: run midi2edgelist then edgelist2vec for one batch.
-    args = (batch_id, list_of_file_paths, xmidi_dir, batch_output_root, dimensions, reset, edgelist2vec_workers).
+    Run midi2edgelist then edgelist2vec for one batch (single-threaded).
+    args = (batch_id, list_of_file_paths, xmidi_dir, batch_output_root, dimensions, reset).
     Returns (batch_id, success).
     """
     (
@@ -238,7 +238,6 @@ def _run_one_batch(args: tuple) -> tuple[int, bool]:
         batch_output_root,
         dimensions,
         reset,
-        edgelist2vec_workers,
     ) = args
     batch_dir = os.path.join(batch_output_root, f"batch_{batch_id}")
     embeddings_bin = os.path.join(batch_dir, "embeddings.bin")
@@ -254,7 +253,7 @@ def _run_one_batch(args: tuple) -> tuple[int, bool]:
         embeddings_bin,
         dimensions=dimensions,
         show_progress=False,
-        workers=edgelist2vec_workers,
+        workers=1,
     ):
         return (batch_id, False)
     names_src = os.path.join(edgelist_dir, "names.csv")
@@ -273,11 +272,13 @@ def preprocess_xmidi_midi2vec_batched(
     dimensions: int = 100,
     reset: bool = False,
     show_progress: bool = True,
-    num_batch_workers: int = None,
-    edgelist2vec_workers: int = 1,
+    num_workers: int = None,
 ):
     """
     Preprocess XMIDI with batched midi2vec: stratified assignment, parallel batch runs, then consolidate.
+
+    Each batch is processed with one core (midi2edgelist + edgelist2vec run single-threaded per batch).
+    num_workers is how many batches run in parallel (Pool size). Total cores used ≈ num_workers.
 
     Args:
         xmidi_dir: Directory containing XMIDI MIDI files
@@ -288,8 +289,7 @@ def preprocess_xmidi_midi2vec_batched(
         dimensions: Embedding dimension
         reset: If True, recompute all batches; otherwise skip batches that already have embeddings.bin
         show_progress: If True, show tqdm over batches
-        num_batch_workers: Number of parallel batch workers (default: min(num_batches, cpu_count))
-        edgelist2vec_workers: Workers passed to edgelist2vec within each batch (1 = single core)
+        num_workers: Number of batches to run in parallel (each batch = 1 core). Default: min(num_batches, cpu_count).
     """
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     if batch_output_root is None:
@@ -323,20 +323,12 @@ def preprocess_xmidi_midi2vec_batched(
         assignments = rows
         logging.info(f"Loaded {assignments_path} ({len(batches)} batches)")
     _compute_and_log_batch_label_statistics(batches, batch_output_root)
-    n_workers = num_batch_workers
+    n_workers = num_workers
     if n_workers is None or n_workers <= 0:
         n_workers = min(len(batches), cpu_count() or 1)
     n_workers = min(n_workers, len(batches))
     worker_args = [
-        (
-            i,
-            batch_files,
-            str(xmidi_path),
-            batch_output_root,
-            dimensions,
-            reset,
-            edgelist2vec_workers,
-        )
+        (i, batch_files, str(xmidi_path), batch_output_root, dimensions, reset)
         for i, batch_files in enumerate(batches)
     ]
     root_logger = logging.getLogger()
@@ -373,8 +365,7 @@ if __name__ == "__main__":
     parser.add_argument("--dimensions", type=int, default=100, help="Embedding dimension")
     parser.add_argument("--reset", action="store_true", help="Recompute all batches (default: skip existing)")
     parser.add_argument("--no_show_progress", action="store_true", help="Disable tqdm over batches")
-    parser.add_argument("--num_batch_workers", type=int, default=None, help="Parallel batch workers (default: min(batches, cpus))")
-    parser.add_argument("--workers", type=int, default=1, help="edgelist2vec workers per batch")
+    parser.add_argument("--num_workers", type=int, default=None, help="Batches to run in parallel (each batch = 1 core; default: min(batches, cpus))")
     args = parser.parse_args()
     preprocess_xmidi_midi2vec_batched(
         args.xmidi_dir,
@@ -385,6 +376,5 @@ if __name__ == "__main__":
         dimensions=args.dimensions,
         reset=args.reset,
         show_progress=not args.no_show_progress,
-        num_batch_workers=args.num_batch_workers,
-        edgelist2vec_workers=args.workers,
+        num_workers=args.num_workers,
     )
