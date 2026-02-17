@@ -37,12 +37,17 @@ Markdown files containing project notes, plans, and documentation:
 
 ## Quick Start
 
-1. **Set up environment**:
+1. **Set up environment** (from repo root):
    ```bash
-   mamba create -n gigamidi python=3.10
+   # Option A: use setup script (creates env from environment.yml if present)
+   ./scripts/setup_env.sh create
+
+   # Option B: manual
+   mamba env create -f environment.yml   # if environment.yml exists
    mamba activate gigamidi
-   pip install -r valence_arousal/requirements.txt
+   pip install -r emotion_genre/requirements.txt
    ```
+   See **SETUP.md** for moving your env to another computer (export/import).
 
 2. **Configure storage directory** (see `valence_arousal/utils/data_utils.py`):
    ```bash

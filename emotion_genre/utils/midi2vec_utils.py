@@ -67,6 +67,42 @@ def _run_midi2edgelist_chunk(args: tuple) -> tuple:
         return (result.returncode == 0, chunk_output_dir)
 
 
+def run_midi2edgelist_for_files(
+    file_paths: List[Path],
+    midi_dir: str,
+    output_dir: str,
+    show_progress: bool = False,
+) -> bool:
+    """
+    Run midi2edgelist on an explicit list of MIDI files by creating a temp dir of symlinks.
+
+    Args:
+        file_paths: List of Paths to MIDI files (must be under midi_dir or comparable).
+        midi_dir: Root directory used to compute relative paths (so names.csv filenames match).
+        output_dir: Where to write edgelists and names.csv.
+        show_progress: If True, show progress (default False for batched workers).
+
+    Returns:
+        True if successful, False otherwise.
+    """
+    midi_path = Path(midi_dir).resolve()
+    with tempfile.TemporaryDirectory(prefix="midi2edgelist_for_files_") as temp_dir:
+        temp_path = Path(temp_dir)
+        for f in file_paths:
+            p = Path(f).resolve()
+            try:
+                rel = p.relative_to(midi_path)
+            except ValueError:
+                rel = p.name
+            dest = temp_path / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                dest.symlink_to(p)
+            except OSError:
+                shutil.copy2(p, dest)
+        return run_midi2edgelist(str(temp_path), output_dir, show_progress=show_progress, workers=1)
+
+
 def _merge_edgelist_outputs(chunk_dirs: List[str], output_dir: str) -> None:
     """Merge edgelist outputs from multiple chunks into final output_dir."""
     edgelist_files = ["notes.edgelist", "program.edgelist", "tempo.edgelist", "time.signature.edgelist"]
@@ -223,28 +259,15 @@ def run_edgelist2vec(
         "--dimensions", str(dimensions),
         "--workers", str(workers),
     ]
+    if not show_progress:
+        cmd.append("--quiet")
     logging.info(f"Running edgelist2vec: {' '.join(cmd)}")
     try:
         if show_progress:
-            # node2vec training progress isn't exposed as a numeric total here, so we show a
-            # line-based progress indicator (and surface error-ish lines).
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
-            with tqdm(desc="edgelist2vec", unit="line") as pbar:
-                for line in proc.stdout:
-                    line = line.rstrip()
-                    if not line:
-                        continue
-                    pbar.update(1)
-                    if "error" in line.lower() or "exception" in line.lower():
-                        logging.warning(line)
-            proc.wait()
-            if proc.returncode != 0:
-                logging.error("edgelist2vec failed (run with show_progress=False to capture stderr)")
+            # Let embed.py's progress (loading edgelists, Nodes/Edges, Start/End learning, nodevectors verbose) go to terminal.
+            result = subprocess.run(cmd)
+            if result.returncode != 0:
+                logging.error("edgelist2vec failed (run with --no_show_progress to capture stderr)")
                 return False
             return True
 
@@ -282,7 +305,7 @@ def load_embeddings_lookup(
     except ImportError:
         raise ImportError("gensim required for load_embeddings_lookup. pip install gensim")
     
-    # nodevectors saves in word2vec binary format
+    # embed.py saves in word2vec binary format
     try:
         kv = KeyedVectors.load_word2vec_format(str(embeddings_bin), binary=True)
     except Exception:
@@ -367,4 +390,92 @@ def extract_embeddings_to_safetensors(
             save_fn(output_path, latents, metadata)
             count += 1
     
+    return count
+
+
+def consolidate_batched_embeddings_to_safetensors(
+    batch_output_root: str,
+    latents_output_dir: str,
+    save_latents_fn=None,
+    ensure_dir_fn=None,
+) -> int:
+    """
+    Extract per-file embeddings from batched outputs into a single latents dir.
+
+    Reads batch_assignments.csv (file_path, batch_id). For each file, loads its
+    embedding from batch_{batch_id}/embeddings.bin using that batch's names.csv
+    to resolve file path to midi id, then writes latents_dir/{stem}.safetensors.
+
+    Args:
+        batch_output_root: Directory containing batch_assignments.csv and batch_0/, batch_1/, ...
+        latents_output_dir: Directory for output .safetensors files (one per file).
+        save_latents_fn: Optional. Default uses data_utils.save_latents.
+        ensure_dir_fn: Optional. Default uses data_utils.ensure_dir.
+
+    Returns:
+        Number of files written.
+    """
+    import sys
+    sys.path.insert(0, str(_EMOTION_GENRE_DIR))
+    from utils.data_utils import save_latents, ensure_dir
+
+    save_fn = save_latents_fn or save_latents
+    ensure_fn = ensure_dir_fn or ensure_dir
+    batch_root = Path(batch_output_root)
+    assignments_path = batch_root / "batch_assignments.csv"
+    if not assignments_path.exists():
+        logging.error(f"batch_assignments.csv not found at {assignments_path}")
+        return 0
+
+    # Read assignments
+    rows = []
+    with open(assignments_path, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            fp = row.get("file_path", "").strip().strip('"')
+            bid = row.get("batch_id", "").strip()
+            if fp and bid != "":
+                try:
+                    rows.append((str(Path(fp).resolve()), int(bid)))
+                except ValueError:
+                    continue
+
+    # Per-batch cache: batch_id -> dict file_path_abs -> (midi_id, vec)
+    batch_cache = {}
+
+    def get_embedding(file_path_abs: str, batch_id: int):
+        if batch_id not in batch_cache:
+            bin_path = batch_root / f"batch_{batch_id}" / "embeddings.bin"
+            csv_path = batch_root / f"batch_{batch_id}" / "names.csv"
+            if not bin_path.exists() or not csv_path.exists():
+                batch_cache[batch_id] = {}
+                return None
+            lookup = load_embeddings_lookup(str(bin_path), str(csv_path))
+            path_to_id_vec = {}
+            with open(csv_path, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    midi_id = row.get("id", "").strip()
+                    fn_cell = row.get("filename", "").strip().strip('"')
+                    fn_abs = str(Path(fn_cell).resolve()) if fn_cell else ""
+                    if midi_id in lookup:
+                        path_to_id_vec[fn_abs] = (midi_id, lookup[midi_id])
+            batch_cache[batch_id] = path_to_id_vec
+        return batch_cache[batch_id].get(file_path_abs)
+
+    ensure_fn(latents_output_dir)
+    count = 0
+    for file_path_abs, batch_id in rows:
+        res = get_embedding(file_path_abs, batch_id)
+        if res is None:
+            logging.warning(f"No embedding for {file_path_abs} in batch_{batch_id}")
+            continue
+        vec, midi_id = res
+        stem = Path(file_path_abs).stem
+        output_path = os.path.join(latents_output_dir, f"{stem}.safetensors")
+        ensure_fn(os.path.dirname(output_path))
+        latents = vec.reshape(1, -1)
+        metadata = {"n_bars": 1, "file_type": "midi2vec", "original_id": midi_id}
+        save_fn(output_path, latents, metadata)
+        count += 1
     return count

@@ -39,6 +39,12 @@ MIDI2VEC_EMBEDDINGS_DIR = os.environ.get(
     os.path.join(STORAGE_DIR, "midi2vec")
 )
 
+# midi2vec batched pipeline output (batch_0/, batch_1/, ..., batch_assignments.csv)
+MIDI2VEC_BATCHES_DIR = os.environ.get(
+    "MIDI2VEC_BATCHES_DIR",
+    os.path.join(STORAGE_DIR, "midi2vec", "batches")
+)
+
 def get_storage_dir() -> str:
     """Get the base storage directory."""
     return STORAGE_DIR
@@ -51,8 +57,8 @@ def set_storage_dir(path: str) -> None:
     """Set the storage directory (call before other operations)."""
     global STORAGE_DIR, XMIDI_EMOTION_GENRE_DIR
     global CHECKPOINTS_DIR, XMIDI_DATA_DIR, XMIDI_LATENTS_DIR, XMIDI_LABELS_DIR
-    global TRAINED_MODEL_DIR, EVALUATION_RESULTS_DIR, MIDI2VEC_EMBEDDINGS_DIR
-    
+    global TRAINED_MODEL_DIR, EVALUATION_RESULTS_DIR, MIDI2VEC_EMBEDDINGS_DIR, MIDI2VEC_BATCHES_DIR
+
     STORAGE_DIR = path
     XMIDI_EMOTION_GENRE_DIR = os.path.join(STORAGE_DIR, "xmidi_emotion_genre")
     CHECKPOINTS_DIR = os.path.join(XMIDI_EMOTION_GENRE_DIR, "checkpoints")
@@ -62,6 +68,7 @@ def set_storage_dir(path: str) -> None:
     TRAINED_MODEL_DIR = os.path.join(CHECKPOINTS_DIR, "trained_models")
     EVALUATION_RESULTS_DIR = os.path.join(XMIDI_EMOTION_GENRE_DIR, "evaluation_results")
     MIDI2VEC_EMBEDDINGS_DIR = os.path.join(STORAGE_DIR, "midi2vec")
+    MIDI2VEC_BATCHES_DIR = os.path.join(STORAGE_DIR, "midi2vec", "batches")
 
 # ================================================== #
 #  File I/O Utilities                               #

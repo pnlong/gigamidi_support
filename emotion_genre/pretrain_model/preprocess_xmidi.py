@@ -18,7 +18,7 @@ from pathlib import Path
 # Add emotion_genre to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from utils.data_utils import XMIDI_LATENTS_DIR, MUSETOK_CHECKPOINT_DIR
+from utils.data_utils import XMIDI_LATENTS_DIR, MUSETOK_CHECKPOINT_DIR, MIDI2VEC_BATCHES_DIR
 
 
 def main():
@@ -50,7 +50,9 @@ def main():
     parser.add_argument("--dimensions", type=int, default=100,
                         help="Embedding dimension (midi2vec only)")
     parser.add_argument("--workers", type=int, default=1,
-                        help="Parallel workers for midi2edgelist and edgelist2vec (1 = single core; 0 = use all CPUs, midi2vec only)")
+                        help="Parallel workers for midi2edgelist and edgelist2vec (1 = single core, slow; 0 = use all CPUs, midi2vec only)")
+    parser.add_argument("--midi2vec_num_batches", type=int, default=20,
+                        help="If set, use batched midi2vec with this many batches (stratified by emotion+genre); output in MIDI2VEC_BATCHES_DIR (midi2vec only)")
     
     # Common
     parser.add_argument("--reset", action="store_true",
@@ -73,16 +75,29 @@ def main():
             num_workers=args.num_workers,
         )
     else:
-        from pretrain_model.preprocess.preprocess_xmidi_midi2vec import preprocess_xmidi_midi2vec
-        preprocess_xmidi_midi2vec(
-            xmidi_dir=args.xmidi_dir,
-            output_dir=args.output_dir,
-            precomputed_dir=args.precomputed,
-            dimensions=args.dimensions,
-            resume=not args.reset,
-            show_progress=not args.no_show_progress,
-            workers=args.workers,
-        )
+        if args.midi2vec_num_batches is not None:
+            from pretrain_model.preprocess.preprocess_xmidi_midi2vec_batched import preprocess_xmidi_midi2vec_batched
+            preprocess_xmidi_midi2vec_batched(
+                xmidi_dir=args.xmidi_dir,
+                output_dir=args.output_dir,
+                batch_output_root=MIDI2VEC_BATCHES_DIR,
+                num_batches=args.midi2vec_num_batches,
+                dimensions=args.dimensions,
+                reset=args.reset,
+                show_progress=not args.no_show_progress,
+                edgelist2vec_workers=args.workers,
+            )
+        else:
+            from pretrain_model.preprocess.preprocess_xmidi_midi2vec import preprocess_xmidi_midi2vec
+            preprocess_xmidi_midi2vec(
+                xmidi_dir=args.xmidi_dir,
+                output_dir=args.output_dir,
+                precomputed_dir=args.precomputed,
+                dimensions=args.dimensions,
+                resume=not args.reset,
+                show_progress=not args.no_show_progress,
+                workers=args.workers,
+            )
 
 
 if __name__ == "__main__":

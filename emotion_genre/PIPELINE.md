@@ -25,6 +25,8 @@ Complete step-by-step guide for training emotion recognition (11 classes) and ge
 
 5. **midi2vec embeddings dir** (for GigaMIDI with midi2vec): Default is `/deepfreeze/pnlong/gigamidi/midi2vec`. Override with `export MIDI2VEC_EMBEDDINGS_DIR=/path/to/midi2vec`.
 
+6. **midi2vec batches dir** (for batched midi2vec): Default is `$STORAGE_DIR/midi2vec/batches` (e.g. `/deepfreeze/pnlong/gigamidi/midi2vec/batches`). Override with `export MIDI2VEC_BATCHES_DIR=/path/to/batches`. Used when `--midi2vec_num_batches` is set.
+
 ---
 
 ## Phase 1: Dataset Download and Preprocessing
@@ -69,6 +71,25 @@ Runs midi2edgelist (Node.js) and edgelist2vec (Python) on the XMIDI directory. O
 **Key Arguments**: `--workers 1` (default) uses a single core. Use `--workers 0` to use all CPU cores, or `--workers N` for N parallel processes. Resume is default; use `--reset` to recompute from scratch. If you stop after midi2edgelist, re-running skips it and continues from edgelist2vec.
 
 **Precomputed**: If you already have `embeddings.bin` and `names.csv` for XMIDI, place them in `$MIDI2VEC_EMBEDDINGS_DIR` and add `--precomputed /path/to/dir` to skip the pipeline.
+
+**Batched midi2vec (stratified, parallel)**  
+For large corpora or to limit memory per run, use batched mode: you set the **number of batches** (`--num_batches` or `--midi2vec_num_batches`); files are split with **stratification by XMIDI labels** (emotion and genre). For each (emotion, genre) group, filepaths are shuffled and distributed round-robin over a shuffled batch order, so label proportions stay similar across all batches. **Default** is **50 batches** when calling the batched script directly; when using `preprocess_xmidi.py` you pass `--midi2vec_num_batches 50` (or another value). Each batch runs midi2edgelist then edgelist2vec in parallel (one process per batch); batches that already have `embeddings.bin` are skipped unless `--reset`. A single **batch_assignments.csv** (columns: `file_path`, `batch_id`) and per-batch dirs (`batch_0/`, `batch_1/`, …) are written under **batch_output_root** (`MIDI2VEC_BATCHES_DIR`). A **consolidation** step then writes one `.safetensors` per file into the same latents dir as non-batched mode, so training and evaluation are unchanged.
+
+After assignment, **per-batch label statistics** are written to `batch_output_root` for manual stratification checks:
+- **batch_label_stats.txt** — per-batch emotion and genre counts (human-readable).
+- **batch_label_stats.csv** — same counts in CSV form (e.g. for plotting or spreadsheets).
+
+Use these to confirm that emotion/genre counts are roughly similar across batches.
+
+```bash
+python pretrain_model/preprocess_xmidi.py \
+    --preprocessor midi2vec \
+    --xmidi_dir /path/to/xmidi \
+    --output_dir /path/to/latents \
+    --midi2vec_num_batches 50
+```
+
+Use `--reset` to recompute all batches and overwrite `batch_assignments.csv`. Omit `--reset` to resume (skip batches that already have `embeddings.bin`).
 
 ### 1.3 Prepare Labels and Create Splits
 
@@ -318,6 +339,13 @@ python analyze_annotations/plot_by_genre.py \
 ├── midi2vec/               # midi2vec precomputed embeddings (optional)
 │   ├── embeddings.bin
 │   ├── names.csv
+│   └── batches/            # batched midi2vec output (when --midi2vec_num_batches is used)
+│       ├── batch_assignments.csv
+│       ├── batch_0/
+│       │   ├── edgelist/
+│       │   ├── embeddings.bin
+│       │   └── names.csv
+│       └── batch_1/ ...
 │   └── gigamidi_midis/    # Exported GigaMIDI as {md5}.mid
 └── xmidi_emotion_genre/
     ├── checkpoints/
