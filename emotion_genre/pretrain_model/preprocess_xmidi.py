@@ -47,7 +47,7 @@ def main():
     # midi2vec-specific
     parser.add_argument("--precomputed", default=None,
                         help="Path to dir with embeddings.bin and names.csv (midi2vec only)")
-    parser.add_argument("--dimensions", type=int, default=100,
+    parser.add_argument("--dimensions", type=int, default=64,
                         help="Embedding dimension (midi2vec only)")
     parser.add_argument("--workers", type=int, default=1,
                         help="midi2vec: parallel workers (non-batched) or batches to run in parallel (batched; each batch=1 core). 0 = use all CPUs (midi2vec only)")

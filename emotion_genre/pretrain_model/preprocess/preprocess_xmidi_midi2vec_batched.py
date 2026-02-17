@@ -245,9 +245,16 @@ def _run_one_batch(args: tuple) -> tuple[int, bool]:
         return (batch_id, True)
     ensure_dir(batch_dir)
     edgelist_dir = os.path.join(batch_dir, "edgelist")
-    path_list = [Path(p) for p in file_paths]
-    if not run_midi2edgelist_for_files(path_list, xmidi_dir, edgelist_dir, show_progress=False):
-        return (batch_id, False)
+    # Check if edgelists already exist (names.csv is created by midi2edgelist)
+    names_csv = os.path.join(edgelist_dir, "names.csv")
+    if not reset and os.path.isfile(names_csv):
+        # Edgelists already exist, skip midi2edgelist and go straight to edgelist2vec
+        logging.info(f"Batch {batch_id}: edgelists already exist, skipping midi2edgelist")
+    else:
+        # Run midi2edgelist to create edgelists
+        path_list = [Path(p) for p in file_paths]
+        if not run_midi2edgelist_for_files(path_list, xmidi_dir, edgelist_dir, show_progress=False):
+            return (batch_id, False)
     if not run_edgelist2vec(
         edgelist_dir,
         embeddings_bin,
@@ -277,6 +284,10 @@ def preprocess_xmidi_midi2vec_batched(
     """
     Preprocess XMIDI with batched midi2vec: stratified assignment, parallel batch runs, then consolidate.
 
+    Batches are stable across runs: when generating, assignment is deterministic (fixed seed); when
+    batch_assignments.csv already exists and --reset is not set, stratification is skipped and that
+    file is loaded, so the same batches are used every time.
+
     Each batch is processed with one core (midi2edgelist + edgelist2vec run single-threaded per batch).
     num_workers is how many batches run in parallel (Pool size). Total cores used ≈ num_workers.
 
@@ -296,23 +307,11 @@ def preprocess_xmidi_midi2vec_batched(
         batch_output_root = MIDI2VEC_BATCHES_DIR
     ensure_dir(batch_output_root)
     xmidi_path = Path(xmidi_dir).resolve()
-    files = find_xmidi_files(str(xmidi_path))
-    if not files:
-        logging.warning(f"No MIDI files found in {xmidi_dir}")
-        return
-    # Canonical paths for CSV
-    files = [str(Path(f).resolve()) for f in files]
     assignments_path = os.path.join(batch_output_root, "batch_assignments.csv")
-    if reset or not os.path.isfile(assignments_path):
-        batches, assignments = _stratified_batch_assignment(files, num_batches, seed)
-        with open(assignments_path, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(["file_path", "batch_id"])
-            for fp, bid in assignments:
-                w.writerow([fp, bid])
-        logging.info(f"Wrote {assignments_path} ({len(batches)} batches, {len(files)} files)")
-    else:
-        # Load assignments and reconstruct batches
+
+    # If batch assignments already exist and we're not resetting, skip stratification and
+    # file discovery entirely — use the previously generated batches (same across runs).
+    if not reset and os.path.isfile(assignments_path):
         with open(assignments_path, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             rows = [(row["file_path"].strip().strip('"'), int(row["batch_id"].strip())) for row in reader]
@@ -320,8 +319,21 @@ def preprocess_xmidi_midi2vec_batched(
         for fp, bid in rows:
             batch_id_to_files.setdefault(bid, []).append(fp)
         batches = [batch_id_to_files[i] for i in sorted(batch_id_to_files)]
-        assignments = rows
-        logging.info(f"Loaded {assignments_path} ({len(batches)} batches)")
+        logging.info(f"Loaded {assignments_path} ({len(batches)} batches, skipping stratification)")
+    else:
+        # Discover files and run stratified batch assignment (deterministic for fixed seed).
+        files = find_xmidi_files(str(xmidi_path))
+        if not files:
+            logging.warning(f"No MIDI files found in {xmidi_dir}")
+            return
+        files = [str(Path(f).resolve()) for f in files]
+        batches, assignments = _stratified_batch_assignment(files, num_batches, seed)
+        with open(assignments_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["file_path", "batch_id"])
+            for fp, bid in assignments:
+                w.writerow([fp, bid])
+        logging.info(f"Wrote {assignments_path} ({len(batches)} stratified batches, {len(files)} files)")
     _compute_and_log_batch_label_statistics(batches, batch_output_root)
     n_workers = num_workers
     if n_workers is None or n_workers <= 0:
@@ -362,7 +374,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_output_root", default=None, help="Batch output root (default: MIDI2VEC_BATCHES_DIR)")
     parser.add_argument("--num_batches", type=int, default=50, help="Number of batches (stratified round-robin per label group)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for stratified assignment")
-    parser.add_argument("--dimensions", type=int, default=100, help="Embedding dimension")
+    parser.add_argument("--dimensions", type=int, default=64, help="Embedding dimension")
     parser.add_argument("--reset", action="store_true", help="Recompute all batches (default: skip existing)")
     parser.add_argument("--no_show_progress", action="store_true", help="Disable tqdm over batches")
     parser.add_argument("--num_workers", type=int, default=None, help="Batches to run in parallel (each batch = 1 core; default: min(batches, cpus))")
