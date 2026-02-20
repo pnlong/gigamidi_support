@@ -270,6 +270,21 @@ def _run_one_batch(args: tuple) -> tuple[int, bool]:
     return (batch_id, True)
 
 
+def _verify_all_batches_success(batch_output_root: str, num_batches: int) -> Tuple[bool, List[int]]:
+    """
+    Verify that each batch directory has embeddings.bin and names.csv.
+    Returns (all_ok, list of batch ids that failed verification).
+    """
+    failed = []
+    for batch_id in range(num_batches):
+        batch_dir = os.path.join(batch_output_root, f"batch_{batch_id}")
+        embeddings_bin = os.path.join(batch_dir, "embeddings.bin")
+        names_csv = os.path.join(batch_dir, "names.csv")
+        if not os.path.isfile(embeddings_bin) or not os.path.isfile(names_csv):
+            failed.append(batch_id)
+    return (len(failed) == 0, failed)
+
+
 def preprocess_xmidi_midi2vec_batched(
     xmidi_dir: str,
     output_dir: str,
@@ -362,6 +377,14 @@ def preprocess_xmidi_midi2vec_batched(
     if failed:
         logging.error(f"Failed batches: {failed}")
         return
+    # Verify all batch directories have expected artifacts (embeddings.bin, names.csv)
+    all_ok, verify_failed = _verify_all_batches_success(batch_output_root, len(batches))
+    if not all_ok:
+        logging.error(
+            f"Verification failed: batch dirs missing embeddings.bin or names.csv: {verify_failed}"
+        )
+        return
+    logging.info(f"Verification passed: all {len(batches)} batches have embeddings.bin and names.csv")
     count = consolidate_batched_embeddings_to_safetensors(batch_output_root, output_dir)
     logging.info(f"Consolidated {count} embeddings to {output_dir}")
 
