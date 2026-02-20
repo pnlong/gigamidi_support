@@ -267,14 +267,23 @@ def run_edgelist2vec(
             # Let embed.py's progress (loading edgelists, Nodes/Edges, Start/End learning, nodevectors verbose) go to terminal.
             result = subprocess.run(cmd)
             if result.returncode != 0:
-                logging.error("edgelist2vec failed (run with --no_show_progress to capture stderr)")
+                logging.error(
+                    "edgelist2vec failed (exit code %d; run with --no_show_progress to capture stderr)",
+                    result.returncode,
+                )
                 return False
             return True
 
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             err = result.stderr if result.stderr else "(no stderr captured)"
-            logging.error(f"edgelist2vec failed: {err}")
+            if "FutureWarning" in err or "DeprecationWarning" in err:
+                logging.warning(
+                    "edgelist2vec exited with code %d (likely due to warnings): %s",
+                    result.returncode, err.strip() or err,
+                )
+            else:
+                logging.error(f"edgelist2vec failed: {err}")
             return False
         return True
     except FileNotFoundError:
