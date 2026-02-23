@@ -88,6 +88,8 @@ def run_midi2edgelist_for_files(
     midi_path = Path(midi_dir).resolve()
     with tempfile.TemporaryDirectory(prefix="midi2edgelist_for_files_") as temp_dir:
         temp_path = Path(temp_dir)
+        # Map temp-path -> real path so we can rewrite names.csv after (midi2edgelist writes temp paths)
+        temp_to_real: Dict[str, str] = {}
         for f in file_paths:
             p = Path(f).resolve()
             try:
@@ -100,7 +102,28 @@ def run_midi2edgelist_for_files(
                 dest.symlink_to(p)
             except OSError:
                 shutil.copy2(p, dest)
-        return run_midi2edgelist(str(temp_path), output_dir, show_progress=show_progress, workers=1)
+            temp_to_real[str(dest)] = str(p)
+            temp_to_real[str(dest.resolve())] = str(p)
+
+        if not run_midi2edgelist(str(temp_path), output_dir, show_progress=show_progress, workers=1):
+            return False
+
+        # Rewrite names.csv so filenames are real paths, not temp paths (consolidation looks up by real path)
+        names_csv = Path(output_dir) / "names.csv"
+        if names_csv.exists() and temp_to_real:
+            lines_out = []
+            with open(names_csv, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    fn = row.get("filename", "").strip().strip('"')
+                    real = temp_to_real.get(fn) or temp_to_real.get(str(Path(fn).resolve()), fn)
+                    lines_out.append((row.get("id", "").strip(), real))
+            with open(names_csv, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(["id", "filename"])
+                for midi_id, real_path in lines_out:
+                    w.writerow([midi_id, real_path])
+    return True
 
 
 def _merge_edgelist_outputs(chunk_dirs: List[str], output_dir: str) -> None:
@@ -298,6 +321,9 @@ def load_embeddings_lookup(
 ) -> Dict[str, np.ndarray]:
     """
     Load embeddings from gensim KeyedVectors and names.csv into a lookup dict.
+
+    Note: word2vec files from nodevectors can contain duplicate "words" (node IDs);
+    gensim warns and keeps the first. We suppress those warnings during load.
     
     Args:
         embeddings_bin: Path to embeddings.bin (gensim KeyedVectors)
@@ -314,11 +340,25 @@ def load_embeddings_lookup(
     except ImportError:
         raise ImportError("gensim required for load_embeddings_lookup. pip install gensim")
     
-    # embed.py saves in word2vec binary format
+    # embed.py (nodevectors) saves in word2vec format. Try binary first, then text.
+    # Do not fall back to KeyedVectors.load() (pickle): that expects a different format
+    # and produces confusing UnpicklingError when the file is actually word2vec.
+    _log = logging.getLogger("gensim")
+    _old_level = _log.level
+    _log.setLevel(logging.ERROR)  # suppress "duplicate word 'X' in word2vec file" warnings
     try:
-        kv = KeyedVectors.load_word2vec_format(str(embeddings_bin), binary=True)
-    except Exception:
-        kv = KeyedVectors.load(str(embeddings_bin), mmap='r')
+        try:
+            kv = KeyedVectors.load_word2vec_format(str(embeddings_bin), binary=True)
+        except Exception as e:
+            try:
+                kv = KeyedVectors.load_word2vec_format(str(embeddings_bin), binary=False)
+            except Exception:
+                raise RuntimeError(
+                    f"Failed to load embeddings from {embeddings_bin} as word2vec (binary or text). "
+                    f"Original error: {e}"
+                ) from e
+    finally:
+        _log.setLevel(_old_level)
     lookup = {}
     
     with open(names_csv, 'r', encoding='utf-8') as f:
@@ -474,12 +514,12 @@ def consolidate_batched_embeddings_to_safetensors(
 
     ensure_fn(latents_output_dir)
     count = 0
-    for file_path_abs, batch_id in rows:
+    for file_path_abs, batch_id in tqdm(rows, desc="consolidate", unit="file"):
         res = get_embedding(file_path_abs, batch_id)
         if res is None:
             logging.warning(f"No embedding for {file_path_abs} in batch_{batch_id}")
             continue
-        vec, midi_id = res
+        midi_id, vec = res
         stem = Path(file_path_abs).stem
         output_path = os.path.join(latents_output_dir, f"{stem}.safetensors")
         ensure_fn(os.path.dirname(output_path))
