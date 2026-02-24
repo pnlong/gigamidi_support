@@ -153,6 +153,13 @@ def parse_args(args=None, namespace=None):
     parser.add_argument("--early_stopping_tolerance", type=int, default=10,
                        help="Early stopping patience")
     
+    # Class imbalance
+    parser.add_argument("--class_weight", type=str, default="balanced",
+                       choices=["none", "balanced"],
+                       help="CrossEntropyLoss class weights: 'balanced' (inverse frequency) or 'none'")
+    parser.add_argument("--balanced_sampler", action="store_true",
+                       help="Use WeightedRandomSampler so each batch sees more minority classes")
+    
     # Others
     parser.add_argument("--gpu", action="store_true",
                        help="Use GPU (CUDA); if not provided, use CPU")
@@ -208,6 +215,39 @@ if __name__ == "__main__":
     valid_files = load_file_list(args.valid_files)
     
     logging.info(f"Train files: {len(train_files)}, Valid files: {len(valid_files)}")
+    # Log per-class counts from file lists (labels) to verify split matches prepare_labels
+    labels_dict = load_json(args.labels_path)
+    class_to_index = load_json(args.class_to_index_path)
+    # Support both int and str values from JSON for index_to_class
+    index_to_class = {}
+    for k, v in class_to_index.items():
+        idx = int(v) if isinstance(v, str) else v
+        index_to_class[idx] = k
+    num_classes = len(class_to_index)
+    train_labels = [labels_dict.get(f) for f in train_files if f in labels_dict]
+    valid_labels = [labels_dict.get(f) for f in valid_files if f in labels_dict]
+    train_missing = sum(1 for f in train_files if f not in labels_dict)
+    valid_missing = sum(1 for f in valid_files if f not in labels_dict)
+    if train_missing or valid_missing:
+        logging.warning(f"Files in list but not in labels: train={train_missing}, valid={valid_missing}")
+    train_counts = np.bincount(train_labels, minlength=num_classes)
+    valid_counts = np.bincount(valid_labels, minlength=num_classes)
+    logging.info(f"Per-class count in train: {train_counts.tolist()} ({[index_to_class[i] for i in range(num_classes)]})")
+    logging.info(f"Per-class count in valid: {valid_counts.tolist()}")
+    if (valid_counts == 0).any():
+        logging.warning(f"Classes with no samples in valid set: {[index_to_class[i] for i in range(num_classes) if valid_counts[i] == 0]}")
+    
+    # Class weights for imbalanced training (inverse frequency)
+    if args.class_weight == "balanced":
+        # weight[c] = n_samples / (n_classes * n_samples_in_class); rare classes get higher weight
+        class_weights = np.zeros(num_classes, dtype=np.float32)
+        for c in range(num_classes):
+            n_c = max(1, train_counts[c])
+            class_weights[c] = len(train_labels) / (num_classes * n_c)
+        class_weights_tensor = torch.from_numpy(class_weights).float().to(device)
+        logging.info(f"Class weights (balanced): {class_weights.tolist()}")
+    else:
+        class_weights_tensor = None
     
     # Create datasets
     train_dataset = XMIDIDataset(
@@ -225,14 +265,39 @@ if __name__ == "__main__":
         task=args.task,
     )
     
-    # Create data loaders
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        collate_fn=XMIDIDataset.collate_fn,
-    )
+    # Train data loader: optional WeightedRandomSampler for balanced batches
+    if args.balanced_sampler:
+        # One label per dataset index (same order as train_files)
+        train_label_per_index = [labels_dict.get(f) for f in train_files]
+        # Sample weight per index = 1 / count(class); minority classes sampled more often
+        sample_weights = np.array([
+            1.0 / max(1, train_counts[int(l)]) if l is not None else 1.0
+            for l in train_label_per_index
+        ], dtype=np.float64)
+        sample_weights /= sample_weights.sum()
+        sampler = torch.utils.data.WeightedRandomSampler(
+            weights=torch.from_numpy(sample_weights),
+            num_samples=len(train_dataset),
+            replacement=True,
+        )
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            sampler=sampler,
+            num_workers=args.num_workers,
+            collate_fn=XMIDIDataset.collate_fn,
+        )
+        logging.info("Using WeightedRandomSampler for balanced batches")
+    else:
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            collate_fn=XMIDIDataset.collate_fn,
+        )
+    
     valid_loader = torch.utils.data.DataLoader(
         valid_dataset,
         batch_size=args.batch_size,
@@ -252,8 +317,8 @@ if __name__ == "__main__":
     n_params = sum(p.numel() for p in model.parameters())
     logging.info(f"Model parameters: {n_params:,}")
     
-    # Loss function
-    loss_fn = nn.CrossEntropyLoss()
+    # Loss function (optionally weighted for class imbalance)
+    loss_fn = nn.CrossEntropyLoss(weight=class_weights_tensor)
     
     # Optimizer
     optimizer = torch.optim.AdamW(
@@ -354,8 +419,8 @@ if __name__ == "__main__":
                     valid_metrics[k] += metrics[k] * batch_size
                 valid_count += batch_size
                 
-                all_preds.extend(preds)
-                all_labels.extend(labels)
+                all_preds.extend(preds.tolist())
+                all_labels.extend(labels.tolist())
         
         valid_loss /= valid_count
         for k in valid_metrics:
@@ -391,10 +456,9 @@ if __name__ == "__main__":
             logging.info(f"Saved best model (accuracy: {best_accuracy:.4f})")
             early_stopping_counter = 0
             
-            # Save confusion matrix for best model
-            cm = confusion_matrix(all_labels, all_preds)
-            class_to_index = load_json(args.class_to_index_path)
-            class_names = [class_to_index.get(str(i), f"Class_{i}") for i in range(len(class_to_index))]
+            # Save confusion matrix for best model (always num_classes x num_classes so missing classes show as zeros)
+            cm = confusion_matrix(all_labels, all_preds, labels=list(range(args.num_classes)))
+            class_names = [index_to_class[i] for i in range(args.num_classes)]
             
             plt.figure(figsize=(10, 8))
             sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 

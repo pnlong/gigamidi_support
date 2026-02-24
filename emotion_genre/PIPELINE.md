@@ -66,7 +66,7 @@ python pretrain_model/preprocess_xmidi.py \
     --output_dir /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/latents
 ```
 
-Runs midi2edgelist (Node.js) and edgelist2vec (Python) on the XMIDI directory. Output is compatible with the same dataset/training pipeline. Use `--input_dim 100` when training with midi2vec.
+Runs midi2edgelist (Node.js) and edgelist2vec (Python) on the XMIDI directory. Output is compatible with the same dataset/training pipeline. Use `--input_dim 64` when training with midi2vec.
 
 **Key Arguments**: `--workers 1` (default) uses a single core. Use `--workers 0` to use all CPU cores, or `--workers N` for N parallel processes. Resume is default; use `--reset` to recompute from scratch. If you stop after midi2edgelist, re-running skips it and continues from edgelist2vec.
 
@@ -127,13 +127,15 @@ python pretrain_model/train.py \
     --train_files /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/train_files.txt \
     --valid_files /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/val_files.txt \
     --num_classes 11 \
-    --input_dim 128 \
+    --input_dim 64 \
     --hidden_dim 64 \
-    --batch_size 2048 \
-    --learning_rate 1e-4 \
+    --batch_size 8192 \
+    --learning_rate 1e-3 \
     --weight_decay 1e-5 \
-    --epochs 75 \
+    --epochs 250 \
     --dropout 0.1 \
+    --class_weight balanced \
+    --balanced_sampler \
     --gpu \
     --num_workers 4 \
     --output_dir /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/checkpoints/trained_models \
@@ -154,13 +156,15 @@ python pretrain_model/train.py \
     --train_files /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/train_files.txt \
     --valid_files /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/val_files.txt \
     --num_classes 6 \
-    --input_dim 128 \
+    --input_dim 64 \
     --hidden_dim 64 \
-    --batch_size 2048 \
-    --learning_rate 1e-4 \
+    --batch_size 8192 \
+    --learning_rate 1e-3 \
     --weight_decay 1e-5 \
-    --epochs 75 \
+    --epochs 250 \
     --dropout 0.1 \
+    --class_weight balanced \
+    --balanced_sampler \
     --gpu \
     --num_workers 4 \
     --output_dir /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/checkpoints/trained_models \
@@ -172,7 +176,44 @@ python pretrain_model/train.py \
 
 **Key Arguments**:
 - `--task`: `emotion` or `genre`
+- `--class_weight`: `balanced` (default) uses inverse-frequency class weights in the loss to handle imbalance; use `none` for unweighted loss
+- `--balanced_sampler`: use WeightedRandomSampler so minority classes are seen more often per epoch (recommended with `--class_weight balanced` for emotion)
 - `--resume`: Resume training from best checkpoint
+
+### 2.3 Train Valence–Arousal Regressor
+
+Predicts (valence, arousal) from latents using a fixed mapping from the 11 XMIDI emotion classes to VA pairs. Uses MSE loss with optional class weighting and balanced sampling (same as emotion classifier).
+
+```bash
+python pretrain_model/train_va.py \
+    --latents_dir /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/latents \
+    --emotion_labels_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/emotion_labels.json \
+    --emotion_to_index_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/emotion_to_index.json \
+    --train_files /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/train_files.txt \
+    --valid_files /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/val_files.txt \
+    --input_dim 64 \
+    --hidden_dim 64 \
+    --batch_size 8192 \
+    --learning_rate 1e-4 \
+    --weight_decay 1e-5 \
+    --epochs 75 \
+    --dropout 0.1 \
+    --class_weight balanced \
+    --balanced_sampler \
+    --gpu \
+    --num_workers 4 \
+    --output_dir /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/checkpoints/trained_models \
+    --model_name valence_arousal_regressor \
+    --wandb_project gigamidi-support \
+    --early_stopping \
+    --early_stopping_tolerance 10
+```
+
+**Key Arguments**:
+- `--emotion_labels_path`: Path to emotion_labels.json (filename → emotion index 0..10)
+- `--emotion_to_index_path`: Path to emotion_to_index.json (used for class weights and balanced sampler)
+- `--class_weight`: `balanced` (default) weights MSE by inverse emotion frequency
+- `--balanced_sampler`: Oversample rare emotions per epoch
 
 ---
 
@@ -189,7 +230,7 @@ python pretrain_model/evaluate.py \
     --class_to_index_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/emotion_to_index.json \
     --test_files /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/test_files.txt \
     --num_classes 11 \
-    --input_dim 128 \
+    --input_dim 64 \
     --hidden_dim 64 \
     --batch_size 32 \
     --gpu \
@@ -208,7 +249,7 @@ python pretrain_model/evaluate.py \
     --class_to_index_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/genre_to_index.json \
     --test_files /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/test_files.txt \
     --num_classes 6 \
-    --input_dim 128 \
+    --input_dim 64 \
     --hidden_dim 64 \
     --batch_size 32 \
     --gpu \
@@ -216,7 +257,27 @@ python pretrain_model/evaluate.py \
     --output_dir /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/evaluation_results/genre
 ```
 
-**Output**: Each evaluation generates:
+### 3.3 Evaluate Valence–Arousal Regressor
+
+```bash
+python pretrain_model/evaluate_va.py \
+    --checkpoint_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/checkpoints/trained_models/valence_arousal_regressor/checkpoints/best_model.pt \
+    --latents_dir /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/latents \
+    --emotion_labels_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/emotion_labels.json \
+    --test_files /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/test_files.txt \
+    --input_dim 64 \
+    --hidden_dim 64 \
+    --batch_size 32 \
+    --gpu \
+    --num_workers 4 \
+    --output_dir /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/evaluation_results/valence_arousal
+```
+
+**Output**: `metrics.csv` (MSE, MAE, correlation for valence and arousal), `valence_arousal_scatter.png` (predicted vs true).
+
+---
+
+**Output (3.1 & 3.2)**: Each classification evaluation generates:
 - `metrics.csv`: Overall accuracy, F1-score (macro/weighted), Precision, Recall, per-class metrics
 - `confusion_matrix.png`: Confusion matrix visualization
 - `classification_report.txt`: Detailed per-class classification report

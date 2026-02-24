@@ -38,3 +38,32 @@ class EmotionGenreClassifier(nn.Module):
             logits: (batch_size, num_classes)
         """
         return self.mlp(latents)
+
+
+class ValenceArousalRegressor(nn.Module):
+    """MLP that predicts (valence, arousal) from latents. Same architecture as classifier but output dim 2."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int = None,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        if hidden_dim is None:
+            hidden_dim = input_dim // 2
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 2),
+        )
+
+    def forward(self, latents):
+        """
+        Args:
+            latents: (batch_size, input_dim)
+        Returns:
+            (batch_size, 2) - [valence, arousal]
+        """
+        return self.mlp(latents)

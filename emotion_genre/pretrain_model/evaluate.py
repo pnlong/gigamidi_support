@@ -91,6 +91,16 @@ if __name__ == "__main__":
     ).to(device)
     model.load_state_dict(torch.load(args.checkpoint_path, map_location=device))
     model.eval()
+    # Verify checkpoint matches expected num_classes (wrong value causes "never predicted" classes)
+    final_layer = model.mlp[-1]
+    assert isinstance(final_layer, torch.nn.Linear), "Expected last layer to be Linear"
+    checkpoint_num_classes = final_layer.out_features
+    if checkpoint_num_classes != args.num_classes:
+        logging.error(
+            f"Checkpoint output size ({checkpoint_num_classes}) != --num_classes ({args.num_classes}). "
+            f"Re-evaluate with --num_classes {checkpoint_num_classes}, or retrain with num_classes={args.num_classes}."
+        )
+        raise ValueError("num_classes mismatch")
     logging.info(f"Loaded model from {args.checkpoint_path}")
     
     # Load file list
@@ -155,12 +165,15 @@ if __name__ == "__main__":
     logging.info(f"Precision (macro): {total_metrics['precision_macro']:.4f}")
     logging.info(f"Recall (macro): {total_metrics['recall_macro']:.4f}")
     
-    # Per-class metrics
+    # Per-class metrics (index_to_class: emotion/genre name for each index)
     class_to_index = load_json(args.class_to_index_path)
-    index_to_class = {v: k for k, v in class_to_index.items()}
+    # JSON may load dict values as int or str; support both for index_to_class
+    index_to_class = {}
+    for k, v in class_to_index.items():
+        index_to_class[int(v) if isinstance(v, str) else v] = k
     class_names = [index_to_class.get(i, f"Class_{i}") for i in range(args.num_classes)]
     
-    # Per-class F1, precision, recall
+    # Per-class F1, precision, recall (zero_division=0 to avoid warnings when a class has no predictions)
     f1_per_class = f1_score(all_targets, all_predictions, average=None, zero_division=0)
     precision_per_class = precision_score(all_targets, all_predictions, average=None, zero_division=0)
     recall_per_class = recall_score(all_targets, all_predictions, average=None, zero_division=0)
@@ -183,8 +196,17 @@ if __name__ == "__main__":
     pd.DataFrame([results]).to_csv(os.path.join(args.output_dir, "metrics.csv"), index=False)
     logging.info(f"Saved metrics to {os.path.join(args.output_dir, 'metrics.csv')}")
     
-    # Confusion matrix
-    cm = confusion_matrix(all_targets, all_predictions)
+    # Confusion matrix (always num_classes x num_classes so missing classes show as zeros)
+    cm = confusion_matrix(all_targets, all_predictions, labels=list(range(args.num_classes)))
+    # Diagnose: which classes had no predictions (zero column) vs no true samples (zero row)
+    col_sums = cm.sum(axis=0)
+    row_sums = cm.sum(axis=1)
+    never_predicted = [class_names[i] for i in range(args.num_classes) if col_sums[i] == 0]
+    never_in_test = [class_names[i] for i in range(args.num_classes) if row_sums[i] == 0]
+    if never_predicted:
+        logging.warning(f"Classes never predicted by model (0 predictions): {never_predicted}. Check that the checkpoint was trained with num_classes={args.num_classes} and same class order.")
+    if never_in_test:
+        logging.info(f"Classes with no samples in test set: {never_in_test}")
     plt.figure(figsize=(12, 10))
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
                xticklabels=class_names, yticklabels=class_names)
@@ -198,17 +220,19 @@ if __name__ == "__main__":
     plt.close()
     logging.info(f"Saved confusion matrix to {os.path.join(args.output_dir, 'confusion_matrix.png')}")
     
-    # Classification report
+    # Classification report (zero_division=0 to avoid warnings for classes with no predictions)
     report = classification_report(
         all_targets, all_predictions,
         target_names=class_names,
-        output_dict=True
+        output_dict=True,
+        zero_division=0,
     )
     
     # Save classification report as text
     report_text = classification_report(
         all_targets, all_predictions,
-        target_names=class_names
+        target_names=class_names,
+        zero_division=0,
     )
     with open(os.path.join(args.output_dir, "classification_report.txt"), 'w') as f:
         f.write(report_text)
