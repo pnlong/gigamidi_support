@@ -215,6 +215,44 @@ python pretrain_model/train_va.py \
 - `--class_weight`: `balanced` (default) weights MSE by inverse emotion frequency
 - `--balanced_sampler`: Oversample rare emotions per epoch
 
+### 2.4 Train Combined (MuseTok + midi2vec) Classifier
+
+Uses both MuseTok and midi2vec latents: loads from two dirs, concatenates vectors, normalizes per dimension (mean/std on the training set), and trains the same classifier. **`input_dim` is computed automatically** (MuseTok dim + midi2vec dim, e.g. 128+64=192). You need precomputed latents in both formats (e.g. from Phase 1 with MuseTok and midi2vec).
+
+```bash
+python pretrain_model/train_combined.py \
+    --task emotion \
+    --latents_dir_musetok /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/latents \
+    --latents_dir_midi2vec /path/to/midi2vec/latents \
+    --labels_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/emotion_labels.json \
+    --class_to_index_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/emotion_to_index.json \
+    --train_files /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/train_files.txt \
+    --valid_files /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/val_files.txt \
+    --num_classes 11 \
+    --batch_size 8192 \
+    --learning_rate 1e-3 \
+    --weight_decay 1e-5 \
+    --epochs 1000 \
+    --dropout 0.1 \
+    --class_weight balanced \
+    --balanced_sampler \
+    --gpu \
+    --num_workers 4 \
+    --output_dir /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/checkpoints/trained_models \
+    --model_name emotion_classifier_combined \
+    --wandb_project gigamidi-support \
+    --early_stopping \
+    --early_stopping_tolerance 10
+```
+
+**Key Arguments**:
+- `--latents_dir_musetok`: Directory of MuseTok latents (e.g. from preprocess with MuseTok).
+- `--latents_dir_midi2vec`: Directory of midi2vec latents (same stems as MuseTok).
+- `--stats_path`: Optional. If omitted, normalization mean/std are computed from the training set and saved under `output_dir/model_name/combined_latents_stats.npz`. Pass the same path when evaluating.
+- No `--input_dim`: it is set from the combined stats (MuseTok dim + midi2vec dim).
+
+For genre, use `--task genre`, `--labels_path`/`--class_to_index_path` for genre, `--num_classes 6`, and `--model_name genre_classifier_combined`.
+
 ---
 
 ## Phase 3: Model Evaluation
@@ -274,6 +312,27 @@ python pretrain_model/evaluate_va.py \
 ```
 
 **Output**: `metrics.csv` (MSE, MAE, correlation for valence and arousal), `valence_arousal_scatter.png` (predicted vs true).
+
+### 3.4 Evaluate Combined (MuseTok + midi2vec) Classifier
+
+Use the same `--stats_path` as in training so input_dim and normalization match. **Do not pass `--input_dim`**; it is read from the stats file.
+
+```bash
+python pretrain_model/evaluate_combined.py \
+    --task emotion \
+    --checkpoint_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/checkpoints/trained_models/emotion_classifier_combined/checkpoints/best_model.pt \
+    --latents_dir_musetok /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/latents \
+    --latents_dir_midi2vec /path/to/midi2vec/latents \
+    --stats_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/checkpoints/trained_models/emotion_classifier_combined/combined_latents_stats.npz \
+    --labels_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/emotion_labels.json \
+    --class_to_index_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/emotion_to_index.json \
+    --test_files /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/test_files.txt \
+    --num_classes 11 \
+    --batch_size 32 \
+    --gpu \
+    --num_workers 4 \
+    --output_dir /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/evaluation_results/emotion_combined
+```
 
 ---
 
