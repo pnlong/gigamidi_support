@@ -1,16 +1,75 @@
 """Dataset class for XMIDI latents and labels."""
+import os
+import sys
+import logging
+from collections import defaultdict
+from typing import List, Dict, Tuple, Optional
+
+import numpy as np
 import torch
 from torch.utils.data import Dataset
-import os
-import logging
-import numpy as np
-from typing import List, Dict, Tuple, Optional
-import sys
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from utils.data_utils import load_latents, load_json
+
+
+def get_bootstrap_downsampled_file_list(
+    file_list: List[str],
+    labels_dict: Dict[str, int],
+    class_to_index: Dict[str, int],
+    seed: int = 0,
+) -> List[str]:
+    """
+    Bootstrap resample and downsample all classes to match the smallest class size.
+
+    For each class, sample n_min instances with replacement (bootstrap), where
+    n_min = min over classes of (count). Produces a balanced training set of
+    size num_classes * n_min. Used to reduce bias from imbalanced ground truth.
+
+    Args:
+        file_list: List of filenames (without extension).
+        labels_dict: Mapping filename -> label (int or str class index/name).
+        class_to_index: Mapping class name -> int index (used to normalize str labels).
+        seed: Random seed for reproducible bootstrap.
+
+    Returns:
+        Flat list of filenames, length num_classes * n_min.
+    """
+    num_classes = len(class_to_index)
+    # Normalize labels to int indices
+    def to_index(label):  # noqa: E306
+        if isinstance(label, int) and 0 <= label < num_classes:
+            return label
+        if isinstance(label, str) and label in class_to_index:
+            return int(class_to_index[label])
+        return None
+
+    # Group files by class index
+    per_class: Dict[int, List[str]] = defaultdict(list)
+    for f in file_list:
+        lab = labels_dict.get(f)
+        idx = to_index(lab) if lab is not None else None
+        if idx is not None:
+            per_class[idx].append(f)
+
+    for c in range(num_classes):
+        if c not in per_class:
+            per_class[c] = []
+    n_min = min(len(per_class[c]) for c in range(num_classes))
+    if n_min == 0:
+        raise ValueError(
+            "get_bootstrap_downsampled_file_list: at least one class has no samples; "
+            "cannot downsample."
+        )
+    rng = np.random.default_rng(seed)
+    out: List[str] = []
+    for c in range(num_classes):
+        files = per_class[c]
+        indices = rng.integers(0, len(files), size=n_min)
+        out.extend(files[i] for i in indices)
+    return out
 
 
 def compute_combined_latents_stats(

@@ -29,7 +29,7 @@ warnings.simplefilter(action="ignore", category=FutureWarning)
 
 sys.path.insert(0, dirname(dirname(realpath(__file__))))
 
-from pretrain_model.dataset import CombinedLatentsDataset, compute_combined_latents_stats
+from pretrain_model.dataset import CombinedLatentsDataset, compute_combined_latents_stats, get_bootstrap_downsampled_file_list
 from pretrain_model.model import EmotionGenreClassifier
 from pretrain_model.train import evaluate_batch
 from utils.data_utils import (
@@ -74,6 +74,8 @@ def parse_args():
                         help="Default: {task}_classifier_combined")
     parser.add_argument("--wandb_project", type=str, default="gigamidi-support")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--bootstrap_downsample", type=int, default=0,
+                        help="If >0, downsample train set to min class size via bootstrap. 1=one run (seed=0), K=train K models (seeds 0..K-1), save best_model_fold{k}.pt")
     args = parser.parse_args()
     if args.model_name is None:
         args.model_name = f"{args.task}_classifier_combined"
@@ -128,183 +130,202 @@ if __name__ == "__main__":
         args.hidden_dim = input_dim // 2
     logging.info(f"Combined input_dim (from stats): {input_dim}")
 
-    if args.class_weight == "balanced":
-        class_weights = np.zeros(num_classes, dtype=np.float32)
-        for c in range(num_classes):
-            n_c = max(1, train_counts[c])
-            class_weights[c] = len(train_labels) / (num_classes * n_c)
-        class_weights_tensor = torch.from_numpy(class_weights).float().to(device)
-        logging.info(f"Class weights (balanced): {class_weights.tolist()}")
-    else:
-        class_weights_tensor = None
-
-    train_dataset = CombinedLatentsDataset(
-        latents_dir_musetok=args.latents_dir_musetok,
-        latents_dir_midi2vec=args.latents_dir_midi2vec,
-        stats_path=args.stats_path,
-        labels_path=args.labels_path,
-        class_to_index_path=args.class_to_index_path,
-        file_list=train_files,
-        task=args.task,
-    )
-    valid_dataset = CombinedLatentsDataset(
-        latents_dir_musetok=args.latents_dir_musetok,
-        latents_dir_midi2vec=args.latents_dir_midi2vec,
-        stats_path=args.stats_path,
-        labels_path=args.labels_path,
-        class_to_index_path=args.class_to_index_path,
-        file_list=valid_files,
-        task=args.task,
-    )
-
-    if args.balanced_sampler:
-        train_label_per_index = [labels_dict.get(f) for f in train_files]
-        sample_weights = np.array([
-            1.0 / max(1, train_counts[int(l)]) if l is not None else 1.0
-            for l in train_label_per_index
-        ], dtype=np.float64)
-        sample_weights /= sample_weights.sum()
-        sampler = torch.utils.data.WeightedRandomSampler(
-            weights=torch.from_numpy(sample_weights),
-            num_samples=len(train_dataset),
-            replacement=True,
-        )
-        train_loader = torch.utils.data.DataLoader(
-            train_dataset, batch_size=args.batch_size, shuffle=False, sampler=sampler,
-            num_workers=args.num_workers, collate_fn=CombinedLatentsDataset.collate_fn,
-        )
-        logging.info("Using WeightedRandomSampler for balanced batches")
-    else:
-        train_loader = torch.utils.data.DataLoader(
-            train_dataset, batch_size=args.batch_size, shuffle=True,
-            num_workers=args.num_workers, collate_fn=CombinedLatentsDataset.collate_fn,
-        )
-
-    valid_loader = torch.utils.data.DataLoader(
-        valid_dataset, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, collate_fn=CombinedLatentsDataset.collate_fn,
-    )
-
-    model = EmotionGenreClassifier(
-        input_dim=args.input_dim,
-        num_classes=args.num_classes,
-        hidden_dim=args.hidden_dim,
-        dropout=args.dropout,
-    ).to(device)
-    logging.info(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
-
-    loss_fn = nn.CrossEntropyLoss(weight=class_weights_tensor)
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.learning_rate,
-        weight_decay=args.weight_decay,
-    )
-
-    run_name = f"{args.model_name}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-    wandb.init(project=args.wandb_project, name=run_name, config=vars(args))
-    log_file = os.path.join(args.output_dir, args.model_name, "train.log")
-    ensure_dir(os.path.dirname(log_file))
-    logging.getLogger().handlers.clear()
-    logging.getLogger().addHandler(logging.FileHandler(log_file, mode="a" if args.resume else "w"))
-    logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))
-    logging.info(f"Command: python {' '.join(sys.argv)}")
-    logging.info(pprint.pformat(vars(args)))
-
-    best_model_path = os.path.join(args.checkpoint_dir, "best_model.pt")
-    best_optimizer_path = os.path.join(args.checkpoint_dir, "best_optimizer.pt")
-    if args.resume and os.path.exists(best_model_path):
-        model.load_state_dict(torch.load(best_model_path, map_location=device))
-        optimizer.load_state_dict(torch.load(best_optimizer_path, map_location=device))
-        logging.info("Resumed from checkpoint")
-
-    stats_file = os.path.join(args.output_dir, args.model_name, "statistics.csv")
-    stats_columns = ["epoch", "split", "loss", "accuracy", "f1_macro", "f1_weighted", "precision_macro", "recall_macro"]
-    if not os.path.exists(stats_file) or not args.resume:
-        pd.DataFrame(columns=stats_columns).to_csv(stats_file, index=False)
-
-    best_accuracy = 0.0
-    best_metrics = {}
-    early_stopping_counter = 0
-
-    for epoch in range(args.epochs):
-        logging.info(f"\nEpoch {epoch + 1}/{args.epochs}")
-        model.train()
-        train_loss = 0.0
-        train_metrics = {k: 0.0 for k in ["accuracy", "f1_macro", "f1_weighted", "precision_macro", "recall_macro"]}
-        train_count = 0
-        for batch in tqdm(train_loader, desc="Training"):
-            loss, metrics = evaluate_batch(
-                model, batch, loss_fn, device,
-                update_parameters=True, optimizer=optimizer,
+    n_folds = args.bootstrap_downsample if args.bootstrap_downsample > 0 else 1
+    for fold_k in range(n_folds):
+        if args.bootstrap_downsample > 0:
+            train_files_use = get_bootstrap_downsampled_file_list(
+                train_files, labels_dict, class_to_index, seed=fold_k
             )
-            bs = len(batch["latents"])
-            train_loss += loss * bs
-            for k in train_metrics:
-                train_metrics[k] += metrics[k] * bs
-            train_count += bs
-        train_loss /= train_count
-        for k in train_metrics:
-            train_metrics[k] /= train_count
-        logging.info(f"Train - Loss: {train_loss:.4f}, Accuracy: {train_metrics['accuracy']:.4f}, F1: {train_metrics['f1_macro']:.4f}")
+            logging.info(f"Bootstrap fold {fold_k}: using {len(train_files_use)} train files (downsampled)")
+        else:
+            train_files_use = train_files
 
-        model.eval()
-        valid_loss = 0.0
-        valid_metrics = {k: 0.0 for k in train_metrics}
-        valid_count = 0
-        all_preds, all_labels = [], []
-        with torch.no_grad():
-            for batch in tqdm(valid_loader, desc="Validating"):
-                loss, metrics, (preds, labels) = evaluate_batch(
-                    model, batch, loss_fn, device, return_predictions=True,
+        train_labels_fold = [labels_dict.get(f) for f in train_files_use if f in labels_dict]
+        train_counts_fold = np.bincount(train_labels_fold, minlength=num_classes)
+        if args.bootstrap_downsample > 0:
+            logging.info(f"Per-class count (fold {fold_k}): {train_counts_fold.tolist()}")
+
+        if args.class_weight == "balanced":
+            class_weights = np.zeros(num_classes, dtype=np.float32)
+            for c in range(num_classes):
+                n_c = max(1, train_counts_fold[c])
+                class_weights[c] = len(train_labels_fold) / (num_classes * n_c)
+            class_weights_tensor = torch.from_numpy(class_weights).float().to(device)
+            logging.info(f"Class weights (balanced): {class_weights.tolist()}")
+        else:
+            class_weights_tensor = None
+
+        train_dataset = CombinedLatentsDataset(
+            latents_dir_musetok=args.latents_dir_musetok,
+            latents_dir_midi2vec=args.latents_dir_midi2vec,
+            stats_path=args.stats_path,
+            labels_path=args.labels_path,
+            class_to_index_path=args.class_to_index_path,
+            file_list=train_files_use,
+            task=args.task,
+        )
+        valid_dataset = CombinedLatentsDataset(
+            latents_dir_musetok=args.latents_dir_musetok,
+            latents_dir_midi2vec=args.latents_dir_midi2vec,
+            stats_path=args.stats_path,
+            labels_path=args.labels_path,
+            class_to_index_path=args.class_to_index_path,
+            file_list=valid_files,
+            task=args.task,
+        )
+
+        if args.balanced_sampler:
+            train_label_per_index = [labels_dict.get(f) for f in train_files_use]
+            sample_weights = np.array([
+                1.0 / max(1, train_counts_fold[int(l)]) if l is not None else 1.0
+                for l in train_label_per_index
+            ], dtype=np.float64)
+            sample_weights /= sample_weights.sum()
+            sampler = torch.utils.data.WeightedRandomSampler(
+                weights=torch.from_numpy(sample_weights),
+                num_samples=len(train_dataset),
+                replacement=True,
+            )
+            train_loader = torch.utils.data.DataLoader(
+                train_dataset, batch_size=args.batch_size, shuffle=False, sampler=sampler,
+                num_workers=args.num_workers, collate_fn=CombinedLatentsDataset.collate_fn,
+            )
+            logging.info("Using WeightedRandomSampler for balanced batches")
+        else:
+            train_loader = torch.utils.data.DataLoader(
+                train_dataset, batch_size=args.batch_size, shuffle=True,
+                num_workers=args.num_workers, collate_fn=CombinedLatentsDataset.collate_fn,
+            )
+
+        valid_loader = torch.utils.data.DataLoader(
+            valid_dataset, batch_size=args.batch_size, shuffle=False,
+            num_workers=args.num_workers, collate_fn=CombinedLatentsDataset.collate_fn,
+        )
+
+        model = EmotionGenreClassifier(
+            input_dim=args.input_dim,
+            num_classes=args.num_classes,
+            hidden_dim=args.hidden_dim,
+            dropout=args.dropout,
+        ).to(device)
+        logging.info(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+        loss_fn = nn.CrossEntropyLoss(weight=class_weights_tensor)
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=args.learning_rate,
+            weight_decay=args.weight_decay,
+        )
+
+        checkpoint_suffix = f"_fold{fold_k}" if args.bootstrap_downsample > 1 else ""
+        best_model_path = os.path.join(args.checkpoint_dir, f"best_model{checkpoint_suffix}.pt")
+        best_optimizer_path = os.path.join(args.checkpoint_dir, f"best_optimizer{checkpoint_suffix}.pt")
+        stats_file = os.path.join(args.output_dir, args.model_name, f"statistics{checkpoint_suffix}.csv")
+
+        run_name = f"{args.model_name}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        if args.bootstrap_downsample > 1:
+            run_name = f"{run_name}-fold{fold_k}"
+        wandb.init(project=args.wandb_project, name=run_name, config=vars(args))
+        log_file = os.path.join(args.output_dir, args.model_name, "train.log")
+        ensure_dir(os.path.dirname(log_file))
+        logging.getLogger().handlers.clear()
+        logging.getLogger().addHandler(logging.FileHandler(log_file, mode="a" if args.resume and fold_k == 0 else "w"))
+        logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))
+        logging.info(f"Command: python {' '.join(sys.argv)}")
+        logging.info(pprint.pformat(vars(args)))
+
+        if args.resume and os.path.exists(best_model_path):
+            model.load_state_dict(torch.load(best_model_path, map_location=device))
+            optimizer.load_state_dict(torch.load(best_optimizer_path, map_location=device))
+            logging.info("Resumed from checkpoint")
+
+        stats_columns = ["epoch", "split", "loss", "accuracy", "f1_macro", "f1_weighted", "precision_macro", "recall_macro"]
+        if not os.path.exists(stats_file) or not args.resume:
+            pd.DataFrame(columns=stats_columns).to_csv(stats_file, index=False)
+
+        best_accuracy = 0.0
+        best_metrics = {}
+        early_stopping_counter = 0
+
+        for epoch in range(args.epochs):
+            logging.info(f"\nEpoch {epoch + 1}/{args.epochs}")
+            model.train()
+            train_loss = 0.0
+            train_metrics = {k: 0.0 for k in ["accuracy", "f1_macro", "f1_weighted", "precision_macro", "recall_macro"]}
+            train_count = 0
+            for batch in tqdm(train_loader, desc="Training"):
+                loss, metrics = evaluate_batch(
+                    model, batch, loss_fn, device,
+                    update_parameters=True, optimizer=optimizer,
                 )
                 bs = len(batch["latents"])
-                valid_loss += loss * bs
-                for k in valid_metrics:
-                    valid_metrics[k] += metrics[k] * bs
-                valid_count += bs
-                all_preds.extend(preds.tolist())
-                all_labels.extend(labels.tolist())
-        valid_loss /= valid_count
-        for k in valid_metrics:
-            valid_metrics[k] /= valid_count
-        logging.info(f"Valid - Loss: {valid_loss:.4f}, Accuracy: {valid_metrics['accuracy']:.4f}, F1: {valid_metrics['f1_macro']:.4f}")
+                train_loss += loss * bs
+                for k in train_metrics:
+                    train_metrics[k] += metrics[k] * bs
+                train_count += bs
+            train_loss /= train_count
+            for k in train_metrics:
+                train_metrics[k] /= train_count
+            logging.info(f"Train - Loss: {train_loss:.4f}, Accuracy: {train_metrics['accuracy']:.4f}, F1: {train_metrics['f1_macro']:.4f}")
 
-        for split, loss_val, m in [("train", train_loss, train_metrics), ("valid", valid_loss, valid_metrics)]:
-            pd.DataFrame([{"epoch": epoch + 1, "split": split, "loss": loss_val, **m}]).to_csv(
-                stats_file, mode="a", header=False, index=False
-            )
-        wandb.log({
-            "epoch": epoch + 1,
-            "train/loss": train_loss, "valid/loss": valid_loss,
-            **{f"train/{k}": v for k, v in train_metrics.items()},
-            **{f"valid/{k}": v for k, v in valid_metrics.items()},
-        })
+            model.eval()
+            valid_loss = 0.0
+            valid_metrics = {k: 0.0 for k in train_metrics}
+            valid_count = 0
+            all_preds, all_labels = [], []
+            with torch.no_grad():
+                for batch in tqdm(valid_loader, desc="Validating"):
+                    loss, metrics, (preds, labels) = evaluate_batch(
+                        model, batch, loss_fn, device, return_predictions=True,
+                    )
+                    bs = len(batch["latents"])
+                    valid_loss += loss * bs
+                    for k in valid_metrics:
+                        valid_metrics[k] += metrics[k] * bs
+                    valid_count += bs
+                    all_preds.extend(preds.tolist())
+                    all_labels.extend(labels.tolist())
+            valid_loss /= valid_count
+            for k in valid_metrics:
+                valid_metrics[k] /= valid_count
+            logging.info(f"Valid - Loss: {valid_loss:.4f}, Accuracy: {valid_metrics['accuracy']:.4f}, F1: {valid_metrics['f1_macro']:.4f}")
 
-        if valid_metrics["accuracy"] > best_accuracy:
-            best_accuracy = valid_metrics["accuracy"]
-            best_metrics = valid_metrics.copy()
-            torch.save(model.state_dict(), best_model_path)
-            torch.save(optimizer.state_dict(), best_optimizer_path)
-            logging.info(f"Saved best model (accuracy: {best_accuracy:.4f})")
-            early_stopping_counter = 0
-            cm = confusion_matrix(all_labels, all_preds, labels=list(range(args.num_classes)))
-            class_names = [index_to_class[i] for i in range(args.num_classes)]
-            plt.figure(figsize=(10, 8))
-            sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
-                        xticklabels=class_names, yticklabels=class_names)
-            plt.title(f"Confusion Matrix - Epoch {epoch + 1}")
-            plt.ylabel("True Label")
-            plt.xlabel("Predicted Label")
-            plt.tight_layout()
-            plt.savefig(os.path.join(args.output_dir, args.model_name, "confusion_matrix_best.png"), dpi=150)
-            plt.close()
-        else:
-            early_stopping_counter += 1
-        if args.early_stopping and early_stopping_counter >= args.early_stopping_tolerance:
-            logging.info(f"Early stopping after {args.early_stopping_tolerance} epochs without improvement")
-            break
+            for split, loss_val, m in [("train", train_loss, train_metrics), ("valid", valid_loss, valid_metrics)]:
+                pd.DataFrame([{"epoch": epoch + 1, "split": split, "loss": loss_val, **m}]).to_csv(
+                    stats_file, mode="a", header=False, index=False
+                )
+            wandb.log({
+                "epoch": epoch + 1,
+                "train/loss": train_loss, "valid/loss": valid_loss,
+                **{f"train/{k}": v for k, v in train_metrics.items()},
+                **{f"valid/{k}": v for k, v in valid_metrics.items()},
+            })
 
-    logging.info("Training complete!")
-    logging.info(f"Best validation accuracy: {best_accuracy:.4f}")
-    logging.info(f"Best metrics: {best_metrics}")
-    wandb.finish()
+            if valid_metrics["accuracy"] > best_accuracy:
+                best_accuracy = valid_metrics["accuracy"]
+                best_metrics = valid_metrics.copy()
+                torch.save(model.state_dict(), best_model_path)
+                torch.save(optimizer.state_dict(), best_optimizer_path)
+                logging.info(f"Saved best model (accuracy: {best_accuracy:.4f})")
+                early_stopping_counter = 0
+                cm = confusion_matrix(all_labels, all_preds, labels=list(range(args.num_classes)))
+                class_names = [index_to_class[i] for i in range(args.num_classes)]
+                plt.figure(figsize=(10, 8))
+                sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+                            xticklabels=class_names, yticklabels=class_names)
+                plt.title(f"Confusion Matrix - Epoch {epoch + 1}")
+                plt.ylabel("True Label")
+                plt.xlabel("Predicted Label")
+                plt.tight_layout()
+                plt.savefig(os.path.join(args.output_dir, args.model_name, f"confusion_matrix_best{checkpoint_suffix}.png"), dpi=150)
+                plt.close()
+            else:
+                early_stopping_counter += 1
+            if args.early_stopping and early_stopping_counter >= args.early_stopping_tolerance:
+                logging.info(f"Early stopping after {args.early_stopping_tolerance} epochs without improvement")
+                break
+
+        logging.info("Training complete!" + (f" (fold {fold_k})" if args.bootstrap_downsample > 1 else ""))
+        logging.info(f"Best validation accuracy: {best_accuracy:.4f}")
+        logging.info(f"Best metrics: {best_metrics}")
+        wandb.finish()

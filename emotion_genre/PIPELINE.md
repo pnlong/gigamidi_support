@@ -59,11 +59,13 @@ python pretrain_model/preprocess_xmidi.py \
 
 #### Option B: midi2vec
 
+XMIDI midi2vec latents are written to a dedicated subdirectory so they can coexist with MuseTok latents. The standard path used in this pipeline is **`latents_midi2vec`** under the xmidi data dir (e.g. `/deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/latents_midi2vec`).
+
 ```bash
 python pretrain_model/preprocess_xmidi.py \
     --preprocessor midi2vec \
     --xmidi_dir /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data \
-    --output_dir /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/latents
+    --output_dir /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/latents_midi2vec
 ```
 
 Runs midi2edgelist (Node.js) and edgelist2vec (Python) on the XMIDI directory. Output is compatible with the same dataset/training pipeline. Use `--input_dim 64` when training with midi2vec.
@@ -179,6 +181,16 @@ python pretrain_model/train.py \
 - `--class_weight`: `balanced` (default) uses inverse-frequency class weights in the loss to handle imbalance; use `none` for unweighted loss
 - `--balanced_sampler`: use WeightedRandomSampler so minority classes are seen more often per epoch (recommended with `--class_weight balanced` for emotion)
 - `--resume`: Resume training from best checkpoint
+- `--bootstrap_downsample`: If set, use K-fold bootstrap downsampling to balance classes (downsample to min class size). `0` (default) = full train set; `1` = one balanced run (seed=0); `10` = train 10 models (seeds 0..9), save `best_model_fold0.pt` … `best_model_fold9.pt`
+
+**Bootstrap downsampling (imbalanced data)**: To reduce bias from class imbalance, use a single balanced run:
+```bash
+python pretrain_model/train.py ... --bootstrap_downsample 1
+```
+Or train 10 models (one per bootstrap fold) for ensemble use:
+```bash
+python pretrain_model/train.py ... --bootstrap_downsample 10
+```
 
 ### 2.3 Train Valence–Arousal Regressor
 
@@ -222,8 +234,8 @@ Uses both MuseTok and midi2vec latents: loads from two dirs, concatenates vector
 ```bash
 python pretrain_model/train_combined.py \
     --task emotion \
-    --latents_dir_musetok /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/latents \
-    --latents_dir_midi2vec /path/to/midi2vec/latents \
+    --latents_dir_musetok /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/latents_musetok \
+    --latents_dir_midi2vec /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/latents_midi2vec \
     --labels_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/emotion_labels.json \
     --class_to_index_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/emotion_to_index.json \
     --train_files /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/train_files.txt \
@@ -247,11 +259,40 @@ python pretrain_model/train_combined.py \
 
 **Key Arguments**:
 - `--latents_dir_musetok`: Directory of MuseTok latents (e.g. from preprocess with MuseTok).
-- `--latents_dir_midi2vec`: Directory of midi2vec latents (same stems as MuseTok).
+- `--latents_dir_midi2vec`: Directory of midi2vec latents (same stems as MuseTok). Standard path: `/deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/latents_midi2vec`.
 - `--stats_path`: Optional. If omitted, normalization mean/std are computed from the training set and saved under `output_dir/model_name/combined_latents_stats.npz`. Pass the same path when evaluating.
 - No `--input_dim`: it is set from the combined stats (MuseTok dim + midi2vec dim).
+- `--bootstrap_downsample`: Same as in 2.1 (0=full, 1=one balanced run, K=K models with `best_model_fold{k}.pt`).
 
 For genre, use `--task genre`, `--labels_path`/`--class_to_index_path` for genre, `--num_classes 6`, and `--model_name genre_classifier_combined`.
+
+### 2.5 Train sklearn Ensemble (MLP, LogReg, SVM, KNN, Random Forest)
+
+Trains five sklearn classifiers on the same (optionally downsampled) latents, then combines their top-3 predictions via majority vote and reports an uncertainty (disagreement across the ensemble). Useful for robust labels and error estimates.
+
+```bash
+python pretrain_model/train_ensemble_sklearn.py \
+    --task emotion \
+    --latents_dir /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/latents_midi2vec \
+    --labels_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/emotion_labels.json \
+    --class_to_index_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/emotion_to_index.json \
+    --train_files /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/train_files.txt \
+    --test_files /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/test_files.txt \
+    --valid_files /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/val_files.txt \
+    --num_classes 11 \
+    --bootstrap_downsample_seed 42 \
+    --n_bootstrap_folds 10 \
+    --output_dir /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/ensemble_sklearn/emotion \
+    --save_predictions
+```
+
+**Key Arguments**:
+- `--latents_dir`: Single latents directory (e.g. midi2vec 64d); use `latents_midi2vec` path for XMIDI midi2vec output.
+- `--bootstrap_downsample_seed`: If set, downsample training set to min class size with this seed (one balanced set when `--n_bootstrap_folds 1`).
+- `--n_bootstrap_folds`: Number of bootstrap folds; each fold trains all 5 models on a different downsampled set. Default 1; use 10 for 50 models (10×5) and aggregate predictions.
+- `--save_predictions`: Write a CSV with filename, true/pred label, and uncertainty per sample.
+
+**Outputs**: Saved under `--output_dir`: `model_<name>_fold{k}.joblib` (or `model_<name>.joblib` when n_folds=1), `metrics.txt`, and optionally `predictions.csv` with an `uncertainty` column (fraction of models disagreeing with the chosen label). Ensemble predictions and uncertainty can be used for GigaMIDI annotation or filtering.
 
 ---
 
@@ -322,7 +363,7 @@ python pretrain_model/evaluate_combined.py \
     --task emotion \
     --checkpoint_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/checkpoints/trained_models/emotion_classifier_combined/checkpoints/best_model.pt \
     --latents_dir_musetok /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/latents \
-    --latents_dir_midi2vec /path/to/midi2vec/latents \
+    --latents_dir_midi2vec /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/latents_midi2vec \
     --stats_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/checkpoints/trained_models/emotion_classifier_combined/combined_latents_stats.npz \
     --labels_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/emotion_labels.json \
     --class_to_index_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/emotion_to_index.json \
@@ -479,7 +520,8 @@ python analyze_annotations/plot_by_genre.py \
     │               ├── best_model.pt
     │               └── best_optimizer.pt
     ├── xmidi_data/
-    │   ├── latents/          # Preprocessed latents (.safetensors files)
+    │   ├── latents/          # MuseTok preprocessed latents (.safetensors)
+    │   ├── latents_midi2vec/ # midi2vec preprocessed latents (.safetensors); standard path for XMIDI midi2vec
     │   └── labels/
     │       ├── emotion_labels.json
     │       ├── genre_labels.json
