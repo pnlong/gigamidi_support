@@ -12,7 +12,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from utils.data_utils import load_latents, load_json
+from utils.data_utils import load_latents, load_json, ensure_bars_per_song_index
 
 
 def get_bootstrap_downsampled_file_list(
@@ -128,13 +128,16 @@ def compute_combined_latents_stats(
 
 class XMIDIDataset(Dataset):
     """Dataset for emotion or genre classification."""
-    
-    def __init__(self, 
+
+    COMBINED_STATS_FILENAME = "combined_latents_stats.npz"
+
+    def __init__(self,
                  latents_dir: str,
                  labels_path: str,
                  class_to_index_path: str,
                  file_list: List[str],
-                 task: str = "emotion"):  # "emotion" or "genre"
+                 task: str = "emotion",
+                 bars_per_chunk: int = -1):
         """
         Args:
             latents_dir: Directory containing latent files
@@ -142,41 +145,85 @@ class XMIDIDataset(Dataset):
             class_to_index_path: Path to JSON file mapping class names to indices
             file_list: List of filenames (without extension)
             task: "emotion" or "genre"
+            bars_per_chunk: -1 = song-level (one sample per file, mean over all bars);
+                N > 0 = N bars per chunk, one sample per chunk (mean over chunk bars); MuseTok only.
         """
         self.latents_dir = latents_dir
         self.labels = load_json(labels_path)
         self.class_to_index = load_json(class_to_index_path)
         self.file_list = file_list
         self.task = task
-        
+        self.bars_per_chunk = bars_per_chunk
+
+        # Optional normalization for combined latents dir
+        self.mean = None
+        self.std = None
+        stats_path = os.path.join(latents_dir, self.COMBINED_STATS_FILENAME)
+        if os.path.isfile(stats_path):
+            data = np.load(stats_path)
+            self.mean = torch.from_numpy(data["mean"]).float()
+            self.std = torch.from_numpy(data["std"]).float()
+
+        # Build chunk index when bars_per_chunk > 0: list of (filename, start_bar, end_bar).
+        # Use bars_per_song.csv cache (built on first run if missing) to avoid reading every file.
+        self._chunk_index: List[Tuple[str, int, int]] = []
+        if bars_per_chunk > 0:
+            bars_index = ensure_bars_per_song_index(latents_dir)
+            for filename in file_list:
+                path = os.path.join(latents_dir, f"{filename}.safetensors")
+                if not os.path.isfile(path):
+                    continue
+                if filename in bars_index:
+                    n_bars = bars_index[filename]
+                    if n_bars < 2:
+                        self._chunk_index.append((filename, 0, 1))
+                        continue
+                else:
+                    latents, _ = load_latents(path)
+                    if latents.ndim < 2:
+                        self._chunk_index.append((filename, 0, 1))
+                        continue
+                    n_bars = latents.shape[0]
+                for start in range(0, n_bars, bars_per_chunk):
+                    end = min(start + bars_per_chunk, n_bars)
+                    self._chunk_index.append((filename, start, end))
+            if not self._chunk_index:
+                raise ValueError(
+                    "bars_per_chunk > 0 but no per-bar latents found; use MuseTok latents dir."
+                )
+        else:
+            self._chunk_index = [(f, -1, -1) for f in file_list]
+
         # Create index_to_class mapping
         self.index_to_class = {v: k for k, v in self.class_to_index.items()}
         self.num_classes = len(self.class_to_index)
-        
+
     def __len__(self):
-        return len(self.file_list)
-    
-    def __getitem__(self, idx):
-        filename = self.file_list[idx]
-        
-        # Load per-bar latents (stored as n_bars x 128)
+        return len(self._chunk_index)
+
+    def _get_pooled_vector(self, filename: str, start: int, end: int) -> torch.Tensor:
         latents_path = os.path.join(self.latents_dir, f"{filename}.safetensors")
-        latents, metadata = load_latents(latents_path)
-        latents = torch.from_numpy(latents).float()  # Shape: (n_bars, latent_dim)
-        
-        # Mean pool across bars for song-level prediction
-        # Note: We store per-bar latents to allow flexibility in pooling strategies
-        # (mean, max, attention, etc.) - can be changed here without re-preprocessing
-        latents_pooled = latents.mean(dim=0)  # Shape: (latent_dim,)
-        
-        # Load label (class index)
+        latents, _ = load_latents(latents_path)
+        latents = torch.from_numpy(latents).float()
+        if latents.dim() == 1:
+            latents_pooled = latents
+        elif start < 0 and end < 0:
+            latents_pooled = latents.mean(dim=0)
+        else:
+            latents_pooled = latents[start:end].mean(dim=0)
+        if self.mean is not None and self.std is not None:
+            latents_pooled = (latents_pooled - self.mean) / self.std
+        return latents_pooled
+
+    def __getitem__(self, idx):
+        filename, start, end = self._chunk_index[idx]
+        latents_pooled = self._get_pooled_vector(filename, start, end)
         label = self.labels[filename]
         label = torch.tensor(label, dtype=torch.long)
-        
         return {
             "latents": latents_pooled,
             "label": label,
-            "filename": filename
+            "filename": filename,
         }
     
     @staticmethod
@@ -263,12 +310,15 @@ class CombinedLatentsDataset(Dataset):
 class XMIDIDatasetVA(Dataset):
     """Dataset for valence–arousal regression from XMIDI latents and emotion labels."""
 
+    COMBINED_STATS_FILENAME = "combined_latents_stats.npz"
+
     def __init__(
         self,
         latents_dir: str,
         emotion_labels_path: str,
         file_list: List[str],
         va_mapping: List[tuple] = None,
+        bars_per_chunk: int = -1,
     ):
         """
         Args:
@@ -276,6 +326,7 @@ class XMIDIDatasetVA(Dataset):
             emotion_labels_path: Path to emotion_labels.json (filename -> emotion index 0..10)
             file_list: List of filenames (without extension)
             va_mapping: List of (valence, arousal) per emotion index; default from valence_arousal_mapping
+            bars_per_chunk: -1 = song-level; N > 0 = N bars per chunk (MuseTok only).
         """
         self.latents_dir = latents_dir
         self.labels = load_json(emotion_labels_path)
@@ -284,16 +335,67 @@ class XMIDIDatasetVA(Dataset):
             from pretrain_model.valence_arousal_mapping import EMOTION_INDEX_TO_VALENCE_AROUSAL
             va_mapping = EMOTION_INDEX_TO_VALENCE_AROUSAL
         self.va_mapping = va_mapping
+        self.bars_per_chunk = bars_per_chunk
+
+        # Optional normalization for combined latents dir
+        self.mean = None
+        self.std = None
+        stats_path = os.path.join(latents_dir, self.COMBINED_STATS_FILENAME)
+        if os.path.isfile(stats_path):
+            data = np.load(stats_path)
+            self.mean = torch.from_numpy(data["mean"]).float()
+            self.std = torch.from_numpy(data["std"]).float()
+
+        # Chunk index: list of (filename, start_bar, end_bar).
+        # Use bars_per_song.csv cache (built on first run if missing) to avoid reading every file.
+        self._chunk_index: List[Tuple[str, int, int]] = []
+        if bars_per_chunk > 0:
+            bars_index = ensure_bars_per_song_index(latents_dir)
+            for filename in file_list:
+                path = os.path.join(latents_dir, f"{filename}.safetensors")
+                if not os.path.isfile(path):
+                    continue
+                if filename in bars_index:
+                    n_bars = bars_index[filename]
+                    if n_bars < 2:
+                        self._chunk_index.append((filename, 0, 1))
+                        continue
+                else:
+                    latents, _ = load_latents(path)
+                    if latents.ndim < 2:
+                        self._chunk_index.append((filename, 0, 1))
+                        continue
+                    n_bars = latents.shape[0]
+                for start in range(0, n_bars, bars_per_chunk):
+                    end = min(start + bars_per_chunk, n_bars)
+                    self._chunk_index.append((filename, start, end))
+            if not self._chunk_index:
+                raise ValueError(
+                    "bars_per_chunk > 0 but no per-bar latents found; use MuseTok latents dir."
+                )
+        else:
+            self._chunk_index = [(f, -1, -1) for f in file_list]
 
     def __len__(self):
-        return len(self.file_list)
+        return len(self._chunk_index)
+
+    def _get_pooled_vector(self, filename: str, start: int, end: int) -> torch.Tensor:
+        latents_path = os.path.join(self.latents_dir, f"{filename}.safetensors")
+        latents, _ = load_latents(latents_path)
+        latents = torch.from_numpy(latents).float()
+        if latents.dim() == 1:
+            latents_pooled = latents
+        elif start < 0 and end < 0:
+            latents_pooled = latents.mean(dim=0)
+        else:
+            latents_pooled = latents[start:end].mean(dim=0)
+        if self.mean is not None and self.std is not None:
+            latents_pooled = (latents_pooled - self.mean) / self.std
+        return latents_pooled
 
     def __getitem__(self, idx):
-        filename = self.file_list[idx]
-        latents_path = os.path.join(self.latents_dir, f"{filename}.safetensors")
-        latents, metadata = load_latents(latents_path)
-        latents = torch.from_numpy(latents).float()
-        latents_pooled = latents.mean(dim=0)
+        filename, start, end = self._chunk_index[idx]
+        latents_pooled = self._get_pooled_vector(filename, start, end)
         emotion_index = self.labels[filename]
         if isinstance(emotion_index, str):
             emotion_index = int(emotion_index)

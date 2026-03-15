@@ -1,0 +1,25 @@
+# Emotion classification with combined (MuseTok + midi2vec) latents dir.
+# Run combine_latents.py first to create latents_combined, then train with this config.
+task: emotion
+latents_dir: /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/latents_combined
+labels_path: /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/emotion_labels.json
+class_to_index_path: /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/emotion_to_index.json
+train_files: /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/train_files.txt
+valid_files: /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/val_files.txt
+num_classes: 11
+hidden_dim: 64
+dropout: 0.1
+batch_size: 8192
+learning_rate: 0.001
+weight_decay: 1e-5
+epochs: 1000
+early_stopping: true
+early_stopping_tolerance: 10
+class_weight: balanced
+balanced_sampler: true
+gpu: true
+num_workers: 4
+output_dir: /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/checkpoints/trained_models
+model_name: emotion_classifier_combined
+wandb_project: gigamidi-support
+bootstrap_downsample: 0

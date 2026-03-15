@@ -1,0 +1,27 @@
+# Genre: bar-level chunking (4 bars per chunk) + bootstrap downsampling. MuseTok latents only.
+task: genre
+latents_dir: /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/latents_musetok
+labels_path: /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/genre_labels.json
+class_to_index_path: /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/genre_to_index.json
+train_files: /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/train_files.txt
+valid_files: /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/val_files.txt
+num_classes: 6
+preprocessor: musetok
+input_dim: 128
+hidden_dim: 64
+dropout: 0.1
+batch_size: 8192
+learning_rate: 0.001
+weight_decay: 1e-5
+epochs: 250
+early_stopping: true
+early_stopping_tolerance: 10
+class_weight: balanced
+balanced_sampler: true
+gpu: true
+num_workers: 4
+output_dir: /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/checkpoints/trained_models
+model_name: genre_classifier_bars4
+wandb_project: gigamidi-support
+bars_per_chunk: 4
+bootstrap_downsample: 10

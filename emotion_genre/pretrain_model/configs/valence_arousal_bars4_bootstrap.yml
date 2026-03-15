@@ -1,0 +1,26 @@
+# Valence–arousal regression with bar-level chunking (4 bars) + bootstrap downsampling. MuseTok latents only.
+# Same as valence_arousal_bars4.yml but trains K models (one per bootstrap fold); saves best_model_fold0.pt ... best_model_fold{K-1}.pt.
+latents_dir: /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/latents_musetok
+emotion_labels_path: /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/emotion_labels.json
+emotion_to_index_path: /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/emotion_to_index.json
+train_files: /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/train_files.txt
+valid_files: /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/val_files.txt
+preprocessor: musetok
+input_dim: 128
+hidden_dim: 64
+dropout: 0.1
+batch_size: 512
+learning_rate: 1e-4
+weight_decay: 1e-5
+epochs: 75
+early_stopping: true
+early_stopping_tolerance: 10
+class_weight: balanced
+balanced_sampler: true
+gpu: true
+num_workers: 4
+output_dir: /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/checkpoints/trained_models
+model_name: valence_arousal_regressor_bars4_bootstrap
+wandb_project: gigamidi-support
+bars_per_chunk: 4
+bootstrap_downsample: 10

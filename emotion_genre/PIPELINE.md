@@ -114,6 +114,21 @@ This creates:
 
 **Genre classes** (6 total): rock, pop, country, jazz, classical, traditional
 
+### 1.4 Combine MuseTok + midi2vec latents (optional)
+
+To train or evaluate with a **single latents directory** (combined MuseTok + midi2vec vectors), run the helper script. It writes one `.safetensors` per file (concatenated, song-level). You can then pass `--latents_dir` to `train.py` / `evaluate.py` and omit `--input_dim` (inferred from the dir).
+
+```bash
+python pretrain_model/combine_latents.py \
+    --latents_dir_musetok /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/latents_musetok \
+    --latents_dir_midi2vec /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/latents_midi2vec \
+    --output_dir /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/latents_combined \
+    --train_files /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/train_files.txt
+```
+
+- **--train_files** (optional): If provided, computes per-dimension mean/std over the training set and saves `combined_latents_stats.npz` in the output dir. Training scripts then apply this normalization when loading from the combined dir.
+- Output: one vector per file; `input_dim` = MuseTok dim + midi2vec dim (e.g. 128+64=192). Combined is **song-level only** (no bar-level chunking).
+
 ---
 
 ## Phase 2: Model Training
@@ -178,6 +193,9 @@ python pretrain_model/train.py \
 
 **Key Arguments**:
 - `--task`: `emotion` or `genre`
+- `--input_dim`: Optional when using a single latents dir (e.g. combined from `combine_latents.py`); inferred from the first `.safetensors` in `--latents_dir`.
+- `--bars_per_chunk`: `-1` (default) = song-level (one sample per file, mean over all bars). `N > 0` = N bars per chunk (one sample per chunk, mean over chunk bars); **MuseTok only** (bar-level latents). Useful for valence/arousal or when songs vary within the track.
+- `--config`: Path to a YAML config file (e.g. `pretrain_model/configs/emotion_musetok.yml`). Config values act as defaults; any CLI argument overrides the config.
 - `--class_weight`: `balanced` (default) uses inverse-frequency class weights in the loss to handle imbalance; use `none` for unweighted loss
 - `--balanced_sampler`: use WeightedRandomSampler so minority classes are seen more often per epoch (recommended with `--class_weight balanced` for emotion)
 - `--resume`: Resume training from best checkpoint
@@ -224,47 +242,41 @@ python pretrain_model/train_va.py \
 **Key Arguments**:
 - `--emotion_labels_path`: Path to emotion_labels.json (filename → emotion index 0..10)
 - `--emotion_to_index_path`: Path to emotion_to_index.json (used for class weights and balanced sampler)
+- `--input_dim`: Optional; inferred from `--latents_dir` when omitted (e.g. combined dir).
+- `--bars_per_chunk`: `-1` = song-level; `N > 0` = N bars per chunk (MuseTok only).
+- `--config`: Path to YAML config (e.g. `pretrain_model/configs/valence_arousal_musetok.yml`); CLI overrides config.
 - `--class_weight`: `balanced` (default) weights MSE by inverse emotion frequency
 - `--balanced_sampler`: Oversample rare emotions per epoch
 
 ### 2.4 Train Combined (MuseTok + midi2vec) Classifier
 
-Uses both MuseTok and midi2vec latents: loads from two dirs, concatenates vectors, normalizes per dimension (mean/std on the training set), and trains the same classifier. **`input_dim` is computed automatically** (MuseTok dim + midi2vec dim, e.g. 128+64=192). You need precomputed latents in both formats (e.g. from Phase 1 with MuseTok and midi2vec).
+Use **combine_latents.py** (see 1.4) to create a single combined latents dir, then train with **train.py** and that dir. `input_dim` is inferred automatically; optional normalization is applied if `combined_latents_stats.npz` exists in the combined dir.
 
 ```bash
-python pretrain_model/train_combined.py \
-    --task emotion \
-    --latents_dir_musetok /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/latents_musetok \
+# One-time: create combined dir (include --train_files to write stats for normalization)
+python pretrain_model/combine_latents.py \
+    --latents_dir_musetok /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/latents \
     --latents_dir_midi2vec /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/latents_midi2vec \
+    --output_dir /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/latents_combined \
+    --train_files /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/train_files.txt
+
+# Train emotion classifier (omit --input_dim; it is inferred)
+python pretrain_model/train.py --config pretrain_model/configs/emotion_combined.yml
+# Or with explicit paths:
+python pretrain_model/train.py \
+    --task emotion \
+    --latents_dir /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/latents_combined \
     --labels_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/emotion_labels.json \
     --class_to_index_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/emotion_to_index.json \
     --train_files /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/train_files.txt \
     --valid_files /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/val_files.txt \
     --num_classes 11 \
-    --batch_size 8192 \
-    --learning_rate 1e-3 \
-    --weight_decay 1e-5 \
-    --epochs 1000 \
-    --dropout 0.1 \
-    --class_weight balanced \
-    --balanced_sampler \
-    --gpu \
-    --num_workers 4 \
-    --output_dir /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/checkpoints/trained_models \
     --model_name emotion_classifier_combined \
-    --wandb_project gigamidi-support \
-    --early_stopping \
-    --early_stopping_tolerance 10
+    --batch_size 8192 --learning_rate 1e-3 --epochs 1000 \
+    --class_weight balanced --balanced_sampler --gpu --early_stopping --early_stopping_tolerance 10
 ```
 
-**Key Arguments**:
-- `--latents_dir_musetok`: Directory of MuseTok latents (e.g. from preprocess with MuseTok).
-- `--latents_dir_midi2vec`: Directory of midi2vec latents (same stems as MuseTok). Standard path: `/deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/latents_midi2vec`.
-- `--stats_path`: Optional. If omitted, normalization mean/std are computed from the training set and saved under `output_dir/model_name/combined_latents_stats.npz`. Pass the same path when evaluating.
-- No `--input_dim`: it is set from the combined stats (MuseTok dim + midi2vec dim).
-- `--bootstrap_downsample`: Same as in 2.1 (0=full, 1=one balanced run, K=K models with `best_model_fold{k}.pt`).
-
-For genre, use `--task genre`, `--labels_path`/`--class_to_index_path` for genre, `--num_classes 6`, and `--model_name genre_classifier_combined`.
+For genre, use `--task genre`, genre label paths, `--num_classes 6`, and `--model_name genre_classifier_combined`. Configs: `pretrain_model/configs/emotion_combined.yml`, `pretrain_model/configs/genre_combined.yml`.
 
 ### 2.5 Train sklearn Ensemble (MLP, LogReg, SVM, KNN, Random Forest)
 
@@ -356,15 +368,13 @@ python pretrain_model/evaluate_va.py \
 
 ### 3.4 Evaluate Combined (MuseTok + midi2vec) Classifier
 
-Use the same `--stats_path` as in training so input_dim and normalization match. **Do not pass `--input_dim`**; it is read from the stats file.
+Use the **combined latents dir** (from combine_latents.py) with **evaluate.py**. Omit `--input_dim` (inferred from the dir); normalization is applied automatically if `combined_latents_stats.npz` is in that dir.
 
 ```bash
-python pretrain_model/evaluate_combined.py \
+python pretrain_model/evaluate.py \
     --task emotion \
     --checkpoint_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/checkpoints/trained_models/emotion_classifier_combined/checkpoints/best_model.pt \
-    --latents_dir_musetok /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/latents \
-    --latents_dir_midi2vec /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/latents_midi2vec \
-    --stats_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/checkpoints/trained_models/emotion_classifier_combined/combined_latents_stats.npz \
+    --latents_dir /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/latents_combined \
     --labels_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/emotion_labels.json \
     --class_to_index_path /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/emotion_to_index.json \
     --test_files /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/xmidi_data/labels/test_files.txt \
@@ -375,12 +385,30 @@ python pretrain_model/evaluate_combined.py \
     --output_dir /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/evaluation_results/emotion_combined
 ```
 
+For genre, use `--task genre`, genre label paths, and `--num_classes 6`.
+
 ---
 
 **Output (3.1 & 3.2)**: Each classification evaluation generates:
 - `metrics.csv`: Overall accuracy, F1-score (macro/weighted), Precision, Recall, per-class metrics
 - `confusion_matrix.png`: Confusion matrix visualization
 - `classification_report.txt`: Detailed per-class classification report
+
+**Evaluation and config/bars_per_chunk**: All evaluate scripts accept `--config <path>` (YAML defaults; CLI overrides). For emotion/genre and valence–arousal, `--bars_per_chunk` and `--input_dim` (inferred when omitted) work the same as in training; use the same `bars_per_chunk` as at train time when using bar-level chunking.
+
+---
+
+## Config files (YAML)
+
+Training and evaluation scripts accept `--config <path>` to load default arguments from a YAML file. Any CLI argument overrides the config. Example configs live in `pretrain_model/configs/`:
+
+- `emotion_musetok.yml`, `genre_musetok.yml`: MuseTok latents (with optional `bars_per_chunk`)
+- `emotion_midi2vec.yml`, `genre_midi2vec.yml`: midi2vec latents
+- `emotion_combined.yml`, `genre_combined.yml`: Single combined latents dir
+- `valence_arousal_musetok.yml`, `valence_arousal_midi2vec.yml`: Valence–arousal regression
+- `emotion_bootstrap.yml`, `genre_bootstrap.yml`: Bootstrap downsampling
+
+Replace placeholder paths in the YAML or override via CLI. See `pretrain_model/configs/README.md` for usage.
 
 ---
 
@@ -521,7 +549,8 @@ python analyze_annotations/plot_by_genre.py \
     │               └── best_optimizer.pt
     ├── xmidi_data/
     │   ├── latents/          # MuseTok preprocessed latents (.safetensors)
-    │   ├── latents_midi2vec/ # midi2vec preprocessed latents (.safetensors); standard path for XMIDI midi2vec
+    │   ├── latents_midi2vec/ # midi2vec preprocessed latents (.safetensors)
+    │   ├── latents_combined/ # optional: from combine_latents.py (MuseTok + midi2vec, one vector per file)
     │   └── labels/
     │       ├── emotion_labels.json
     │       ├── genre_labels.json

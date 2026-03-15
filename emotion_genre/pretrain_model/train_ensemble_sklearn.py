@@ -95,6 +95,12 @@ def main():
     parser.add_argument("--output_dir", type=str, default=None,
                         help="Directory for saved models and predictions (default: ./ensemble_sklearn)")
     parser.add_argument("--save_predictions", action="store_true", help="Write predictions CSV with uncertainty")
+    parser.add_argument("--config", type=str, default=None,
+                        help="Path to YAML config file (CLI overrides config)")
+    args_pre, _ = parser.parse_known_args()
+    if getattr(args_pre, "config", None) and os.path.isfile(args_pre.config):
+        from utils.config_utils import load_config, apply_config
+        apply_config(parser, load_config(args_pre.config))
     args = parser.parse_args()
 
     if args.output_dir is None:

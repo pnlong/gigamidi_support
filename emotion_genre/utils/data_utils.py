@@ -1,4 +1,5 @@
 """Data utilities for XMIDI emotion and genre recognition pipeline."""
+import csv
 import os
 from pathlib import Path
 from typing import Optional
@@ -120,6 +121,80 @@ def save_latents(filepath: str, latents: np.ndarray, metadata: Optional[dict] = 
         save_file(tensors, filepath, metadata=metadata_str)
     else:
         save_file(tensors, filepath)
+
+# Cache file (CSV) in latents_dir: filename (no extension) -> n_bars.
+# Used by bar-level chunking to avoid reading every .safetensors file when building the chunk index.
+BARS_PER_SONG_FILENAME = "bars_per_song.csv"
+
+
+def get_bars_per_song_index(latents_dir: str) -> Optional[dict]:
+    """Load cached mapping of filename (no extension) -> n_bars from latents_dir/bars_per_song.csv.
+    Returns None if the cache file does not exist.
+    """
+    path = os.path.join(latents_dir, BARS_PER_SONG_FILENAME)
+    if not os.path.isfile(path):
+        return None
+    out = {}
+    with open(path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            name = row.get("filename", "").strip()
+            if name:
+                try:
+                    out[name] = int(row.get("n_bars", 0))
+                except (ValueError, TypeError):
+                    pass
+    return out
+
+
+def build_bars_per_song_index(latents_dir: str, force: bool = False) -> dict:
+    """Build and write bars_per_song.csv in latents_dir: for each .safetensors file,
+    store (filename without extension) -> n_bars (shape[0], or 1 if 1D).
+    If the cache file already exists and force is False, only load and return it.
+    Otherwise scan the directory, load each file to get shape, write cache, return mapping.
+    """
+    path = os.path.join(latents_dir, BARS_PER_SONG_FILENAME)
+    if not force and os.path.isfile(path):
+        return get_bars_per_song_index(latents_dir) or {}
+    from tqdm import tqdm
+    names = [n for n in os.listdir(latents_dir) if n.endswith(".safetensors")]
+    out = {}
+    for name in tqdm(names, desc="Building bars_per_song cache", unit="file"):
+        fpath = os.path.join(latents_dir, name)
+        try:
+            latents, _ = load_latents(fpath)
+            n_bars = 1 if latents.ndim < 2 else int(latents.shape[0])
+            out[name.replace(".safetensors", "")] = n_bars
+        except Exception:
+            continue
+    ensure_dir(latents_dir)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["filename", "n_bars"])
+        w.writerows([(k, v) for k, v in sorted(out.items())])
+    return out
+
+
+def ensure_bars_per_song_index(latents_dir: str) -> dict:
+    """Return the bars-per-song mapping for latents_dir. If the cache CSV is missing,
+    build it and write it to disk, then return the mapping. Next run will use the cache.
+    """
+    idx = get_bars_per_song_index(latents_dir)
+    if idx is not None:
+        return idx
+    return build_bars_per_song_index(latents_dir, force=True)
+
+
+def infer_input_dim(latents_dir: str) -> int:
+    """Infer feature dimension from the first .safetensors file in latents_dir.
+    Returns shape[-1] so it works for both 1D (song-level) and 2D (n_bars, dim) arrays.
+    """
+    for name in os.listdir(latents_dir):
+        if name.endswith(".safetensors"):
+            path = os.path.join(latents_dir, name)
+            latents, _ = load_latents(path)
+            return int(latents.shape[-1])
+    raise FileNotFoundError(f"No .safetensors files found in {latents_dir}")
+
 
 def load_latents(filepath: str) -> tuple[np.ndarray, Optional[dict]]:
     """Load latents from safetensors file.

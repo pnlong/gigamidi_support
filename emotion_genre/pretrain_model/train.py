@@ -30,7 +30,7 @@ from pretrain_model.dataset import XMIDIDataset, get_bootstrap_downsampled_file_
 from pretrain_model.model import EmotionGenreClassifier
 from utils.data_utils import (
     TRAINED_MODEL_DIR, XMIDI_LATENTS_DIR, XMIDI_LABELS_DIR,
-    ensure_dir, save_json, load_json
+    ensure_dir, save_json, load_json, infer_input_dim,
 )
 
 # ================================================== #
@@ -111,28 +111,30 @@ def parse_args(args=None, namespace=None):
     parser = argparse.ArgumentParser(prog="Train", description="Train emotion/genre classification model.")
     
     # Task
-    parser.add_argument("--task", type=str, required=True,
+    parser.add_argument("--task", type=str, default=None,
                        choices=["emotion", "genre"],
-                       help="Task: emotion or genre")
+                       help="Task: emotion or genre (required if not using --config)")
     
     # Data paths
     parser.add_argument("--latents_dir", type=str, default=XMIDI_LATENTS_DIR,
                        help="Directory containing XMIDI latents")
-    parser.add_argument("--labels_path", type=str, required=True,
+    parser.add_argument("--labels_path", type=str, default=None,
                        help="Path to labels JSON file (emotion_labels.json or genre_labels.json)")
-    parser.add_argument("--class_to_index_path", type=str, required=True,
+    parser.add_argument("--class_to_index_path", type=str, default=None,
                        help="Path to class_to_index JSON file (emotion_to_index.json or genre_to_index.json)")
-    parser.add_argument("--train_files", type=str, required=True,
+    parser.add_argument("--train_files", type=str, default=None,
                        help="Path to train_files.txt")
-    parser.add_argument("--valid_files", type=str, required=True,
+    parser.add_argument("--valid_files", type=str, default=None,
                        help="Path to val_files.txt")
     
     # Model
     parser.add_argument("--preprocessor", choices=["musetok", "midi2vec"], default="musetok",
                        help="Preprocessor used for latents (affects default input_dim)")
     parser.add_argument("--input_dim", type=int, default=None,
-                       help="Input dimension (128 for MuseTok, 100 for midi2vec; overrides default)")
-    parser.add_argument("--num_classes", type=int, required=True,
+                       help="Input dimension (128 MuseTok, 100 midi2vec; inferred from latents_dir if omitted)")
+    parser.add_argument("--bars_per_chunk", type=int, default=-1,
+                       help="Bars per chunk: -1=song-level, N>0=N bars per chunk (MuseTok only)")
+    parser.add_argument("--num_classes", type=int, default=None,
                        help="Number of classes (11 for emotion, 6 for genre)")
     parser.add_argument("--hidden_dim", type=int, default=None,
                        help="Hidden dimension (default: input_dim // 2)")
@@ -175,12 +177,26 @@ def parse_args(args=None, namespace=None):
                        help="Resume from checkpoint")
     parser.add_argument("--bootstrap_downsample", type=int, default=0,
                        help="If >0, downsample train set to min class size via bootstrap. 1=one run (seed=0), K=train K models (seeds 0..K-1), save best_model_fold{k}.pt")
+    parser.add_argument("--config", type=str, default=None,
+                       help="Path to YAML config file (CLI overrides config)")
 
+    # Parse once to get --config; apply config as defaults; parse again so CLI overrides
+    args_pre, _ = parser.parse_known_args(args=args, namespace=namespace)
+    if getattr(args_pre, "config", None) and os.path.isfile(args_pre.config):
+        from utils.config_utils import load_config, apply_config
+        apply_config(parser, load_config(args_pre.config))
     args = parser.parse_args(args=args, namespace=namespace)
-    
-    # Set default input_dim based on preprocessor
+
+    missing = [k for k in ("task", "labels_path", "class_to_index_path", "train_files", "valid_files", "num_classes") if getattr(args, k) is None]
+    if missing:
+        parser.error(f"Missing required (provide via CLI or in --config): {', '.join(missing)}")
+
+    # Infer input_dim from latents_dir if not set
     if args.input_dim is None:
-        args.input_dim = 100 if args.preprocessor == "midi2vec" else 128
+        try:
+            args.input_dim = infer_input_dim(args.latents_dir)
+        except FileNotFoundError:
+            args.input_dim = 100 if args.preprocessor == "midi2vec" else 128
     
     # Set default model name
     if args.model_name is None:
@@ -254,38 +270,58 @@ if __name__ == "__main__":
         if args.bootstrap_downsample > 0:
             logging.info(f"Per-class count (fold {fold_k}): {train_counts_fold.tolist()}")
 
-        # Class weights for imbalanced training (inverse frequency)
-        if args.class_weight == "balanced":
-            class_weights = np.zeros(num_classes, dtype=np.float32)
-            for c in range(num_classes):
-                n_c = max(1, train_counts_fold[c])
-                class_weights[c] = len(train_labels_fold) / (num_classes * n_c)
-            class_weights_tensor = torch.from_numpy(class_weights).float().to(device)
-            logging.info(f"Class weights (balanced): {class_weights.tolist()}")
-        else:
-            class_weights_tensor = None
-
-        # Create datasets
+        # Create train dataset first (needed for chunk-level counts when bars_per_chunk > 0)
         train_dataset = XMIDIDataset(
             latents_dir=args.latents_dir,
             labels_path=args.labels_path,
             class_to_index_path=args.class_to_index_path,
             file_list=train_files_use,
             task=args.task,
+            bars_per_chunk=args.bars_per_chunk,
         )
+        # Chunk-level counts for class weights when using bar-level chunking
+        if args.bars_per_chunk > 0:
+            train_labels_chunk = [
+                labels_dict.get(train_dataset._chunk_index[i][0]) for i in range(len(train_dataset))
+            ]
+            train_counts_fold = np.bincount(
+                [l for l in train_labels_chunk if l is not None], minlength=num_classes
+            )
+            logging.info(f"Per-class count (chunks): {train_counts_fold.tolist()}")
+
+        # Class weights for imbalanced training (inverse frequency)
+        if args.class_weight == "balanced":
+            class_weights = np.zeros(num_classes, dtype=np.float32)
+            n_samples = len(train_dataset)
+            for c in range(num_classes):
+                n_c = max(1, train_counts_fold[c])
+                class_weights[c] = n_samples / (num_classes * n_c)
+            class_weights_tensor = torch.from_numpy(class_weights).float().to(device)
+            logging.info(f"Class weights (balanced): {class_weights.tolist()}")
+        else:
+            class_weights_tensor = None
+
         valid_dataset = XMIDIDataset(
             latents_dir=args.latents_dir,
             labels_path=args.labels_path,
             class_to_index_path=args.class_to_index_path,
             file_list=valid_files,
             task=args.task,
+            bars_per_chunk=args.bars_per_chunk,
         )
 
         # Train data loader: optional WeightedRandomSampler for balanced batches
         if args.balanced_sampler:
-            train_label_per_index = [labels_dict.get(f) for f in train_files_use]
+            # Per-sample labels (per-chunk when bars_per_chunk > 0)
+            train_label_per_index = [
+                labels_dict.get(train_dataset._chunk_index[i][0]) for i in range(len(train_dataset))
+            ]
+            train_counts_chunk = np.bincount(
+                [l for l in train_label_per_index if l is not None],
+                minlength=num_classes,
+            )
             sample_weights = np.array([
-                1.0 / max(1, train_counts_fold[int(l)]) if l is not None else 1.0
+                1.0 / max(1, train_counts_chunk[int(l)]) if l is not None else 1.0
                 for l in train_label_per_index
             ], dtype=np.float64)
             sample_weights /= sample_weights.sum()

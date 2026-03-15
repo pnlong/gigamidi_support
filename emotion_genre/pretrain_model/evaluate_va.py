@@ -20,7 +20,7 @@ sys.path.insert(0, dirname(dirname(realpath(__file__))))
 from pretrain_model.dataset import XMIDIDatasetVA
 from pretrain_model.model import ValenceArousalRegressor
 from pretrain_model.train_va import evaluate_batch_va
-from utils.data_utils import EVALUATION_RESULTS_DIR, ensure_dir, load_json
+from utils.data_utils import EVALUATION_RESULTS_DIR, ensure_dir, load_json, infer_input_dim
 
 
 def parse_args():
@@ -30,7 +30,10 @@ def parse_args():
     parser.add_argument("--emotion_labels_path", type=str, required=True, help="Path to emotion_labels.json")
     parser.add_argument("--test_files", type=str, required=True, help="Path to test_files.txt")
     parser.add_argument("--preprocessor", choices=["musetok", "midi2vec"], default="musetok")
-    parser.add_argument("--input_dim", type=int, default=None)
+    parser.add_argument("--input_dim", type=int, default=None,
+                        help="Inferred from latents_dir if omitted")
+    parser.add_argument("--bars_per_chunk", type=int, default=-1,
+                        help="Bars per chunk: -1=song-level, N>0=N bars (MuseTok only)")
     parser.add_argument("--hidden_dim", type=int, default=None)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--batch_size", type=int, default=32)
@@ -38,9 +41,18 @@ def parse_args():
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--output_dir", type=str, default=None,
                         help="Default: EVALUATION_RESULTS_DIR/valence_arousal")
+    parser.add_argument("--config", type=str, default=None,
+                        help="Path to YAML config file (CLI overrides config)")
+    args_pre, _ = parser.parse_known_args()
+    if getattr(args_pre, "config", None) and os.path.isfile(args_pre.config):
+        from utils.config_utils import load_config, apply_config
+        apply_config(parser, load_config(args_pre.config))
     args = parser.parse_args()
     if args.input_dim is None:
-        args.input_dim = 100 if args.preprocessor == "midi2vec" else 128
+        try:
+            args.input_dim = infer_input_dim(args.latents_dir)
+        except FileNotFoundError:
+            args.input_dim = 100 if args.preprocessor == "midi2vec" else 128
     if args.hidden_dim is None:
         args.hidden_dim = args.input_dim // 2
     if args.output_dir is None:
@@ -74,6 +86,7 @@ if __name__ == "__main__":
         latents_dir=args.latents_dir,
         emotion_labels_path=args.emotion_labels_path,
         file_list=test_files,
+        bars_per_chunk=args.bars_per_chunk,
     )
     test_loader = torch.utils.data.DataLoader(
         test_dataset,
