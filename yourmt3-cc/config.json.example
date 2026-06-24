@@ -1,0 +1,9 @@
+{
+    "exp_id": "mc13_256_g4_all_v7_mt3f_sqr_rms_moe_wf4_n8k2_silu_rope_rp_b80_ps2",
+    "output": "/scratch/<your-username>/output/midi",
+    "data": [
+        "/scratch/<your-username>/audio/track001/mix.wav",
+        "/scratch/<your-username>/audio/track002/mix.wav",
+        "/scratch/<your-username>/audio/track003/mix.wav"
+    ]
+}

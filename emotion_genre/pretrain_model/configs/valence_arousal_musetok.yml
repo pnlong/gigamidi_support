@@ -11,7 +11,7 @@ dropout: 0.1
 batch_size: 8192
 learning_rate: 1e-4
 weight_decay: 1e-5
-epochs: 75
+steps: 75000
 early_stopping: true
 early_stopping_tolerance: 10
 class_weight: balanced
@@ -22,3 +22,4 @@ output_dir: /deepfreeze/pnlong/gigamidi/xmidi_emotion_genre/checkpoints/trained_
 model_name: valence_arousal_regressor
 wandb_project: gigamidi-support
 bars_per_chunk: -1
+valid_steps: 1000

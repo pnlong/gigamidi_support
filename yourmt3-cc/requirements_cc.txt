@@ -1,0 +1,17 @@
+# YourMT3+ dependencies for Compute Canada (Python 3.11, StdEnv/2023)
+# Compute Canada provides optimised wheels for torch/torchaudio/numpy via its
+# own PyPI mirror — they install automatically when the CC modules are loaded.
+
+python-dotenv
+torch
+torchaudio
+mido
+git+https://github.com/craffel/mir_eval.git
+lightning>=2.2.1
+deprecated
+librosa
+einops
+transformers==4.45.1
+numpy==1.26.4
+soundfile
+tqdm

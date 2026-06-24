@@ -3,6 +3,14 @@ Training script for valence–arousal regression from XMIDI latents.
 
 Uses emotion labels and a fixed mapping from emotion index to (valence, arousal).
 Supports class-weighted MSE and balanced sampling so rare emotions contribute more.
+
+WandB metrics (how to judge regressor quality):
+  - valid/mse, valid/mae: Lower is better. MSE penalizes large errors more.
+  - valid/corr_valence, valid/corr_arousal: Pearson correlation of predicted vs true
+    valence/arousal. Closer to 1 (or -1) is better; 0 means no linear relationship.
+  - valid/loss: Same as MSE when not using sample weights. Prefer valid/mse for comparison.
+  Best single summary: valid/mse (or valid/mae) for magnitude of error;
+  valid/corr_* for how well predictions track the target. Good runs: corr > 0.5, MSE/MAE decreasing.
 """
 
 import argparse
@@ -96,9 +104,13 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-5)
-    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--steps", type=int, default=10000,
+                        help="Total training steps. Data iterator resets when exhausted (next batch may be smaller, then full again).")
+    parser.add_argument("--valid_steps", type=int, default=1000,
+                        help="Run validation every N training steps (0 = only at end of training).")
     parser.add_argument("--early_stopping", action="store_true")
-    parser.add_argument("--early_stopping_tolerance", type=int, default=10)
+    parser.add_argument("--early_stopping_tolerance", type=int, default=10,
+                        help="Stop after this many validations without improvement.")
     parser.add_argument("--class_weight", type=str, default="balanced", choices=["none", "balanced"],
                         help="Weight MSE by inverse emotion frequency")
     parser.add_argument("--balanced_sampler", action="store_true",
@@ -280,22 +292,80 @@ if __name__ == "__main__":
             model.load_state_dict(torch.load(best_model_path, map_location=device))
             optimizer.load_state_dict(torch.load(best_optimizer_path, map_location=device))
             logging.info("Resumed from checkpoint")
-        stats_columns = ["epoch", "split", "loss", "mse", "mae", "corr_valence", "corr_arousal"]
+        stats_columns = ["step", "split", "loss", "mse", "mae", "corr_valence", "corr_arousal"]
         if not os.path.exists(stats_file) or not args.resume:
             pd.DataFrame(columns=stats_columns).to_csv(stats_file, index=False)
 
-        best_valid_mse = float("inf")
-        best_metrics = {}
-        early_stopping_counter = 0
+        state = {"best_valid_mse": float("inf"), "best_metrics": {}, "early_stopping_counter": 0, "done": False}
+        segment_size = args.valid_steps if args.valid_steps > 0 else args.steps
+        global_step = 0
+        batch_iter = iter(train_loader)
 
-        logging.info(f"Starting training for {args.epochs} epochs (fold {fold_k})...")
-        for epoch in range(args.epochs):
-            logging.info(f"\nEpoch {epoch + 1}/{args.epochs}")
+        logging.info(f"Starting training for {args.steps} steps (fold {fold_k}). Validation every {args.valid_steps} steps." if args.valid_steps > 0 else f"Starting training for {args.steps} steps (fold {fold_k}). Validation at end only.")
+
+        def run_validation():
+            if train_count_accum == 0:
+                return
+            train_loss = train_loss_accum / train_count_accum
+            train_metrics = {k: train_metrics_accum[k] / train_count_accum for k in train_metrics_accum}
+            model.eval()
+            valid_loss = 0.0
+            valid_metrics = {k: 0.0 for k in train_metrics}
+            valid_count = 0
+            all_preds, all_va = [], []
+            with torch.no_grad():
+                for batch_v in valid_loader:
+                    loss_v, metrics_v, (pred_np, va_np) = evaluate_batch_va(
+                        model, batch_v, loss_fn, device, return_predictions=True,
+                    )
+                    bv = len(batch_v["latents"])
+                    valid_loss += loss_v * bv
+                    for k in valid_metrics:
+                        valid_metrics[k] += metrics_v[k] * bv
+                    valid_count += bv
+                    all_preds.append(pred_np)
+                    all_va.append(va_np)
+            valid_loss /= valid_count
+            for k in valid_metrics:
+                valid_metrics[k] /= valid_count
+            logging.info(f"Step {global_step} - Train Loss: {train_loss:.4f}, Valid MSE: {valid_metrics['mse']:.4f}, corr_v: {valid_metrics['corr_valence']:.3f}, corr_a: {valid_metrics['corr_arousal']:.3f}")
+            for split, loss_val, m in [("train", train_loss, train_metrics), ("valid", valid_loss, valid_metrics)]:
+                pd.DataFrame([{"step": global_step, "split": split, "loss": loss_val, **m}]).to_csv(
+                    stats_file, mode="a", header=False, index=False
+                )
+            wandb.log({
+                "step": global_step,
+                "train/loss": train_loss, "valid/loss": valid_loss,
+                **{f"train/{k}": v for k, v in train_metrics.items()},
+                **{f"valid/{k}": v for k, v in valid_metrics.items()},
+            })
+            if valid_metrics["mse"] < state["best_valid_mse"]:
+                state["best_valid_mse"] = valid_metrics["mse"]
+                state["best_metrics"] = valid_metrics.copy()
+                torch.save(model.state_dict(), best_model_path)
+                torch.save(optimizer.state_dict(), best_optimizer_path)
+                logging.info(f"Saved best model (valid MSE: {state['best_valid_mse']:.4f})")
+                state["early_stopping_counter"] = 0
+            else:
+                state["early_stopping_counter"] += 1
+            if args.early_stopping and state["early_stopping_counter"] >= args.early_stopping_tolerance:
+                logging.info(f"Early stopping after {state['early_stopping_counter']} validations without improvement")
+                state["done"] = True
             model.train()
-            train_loss = 0.0
-            train_metrics = {k: 0.0 for k in ["mse", "mae", "corr_valence", "corr_arousal"]}
-            train_count = 0
-            for batch in tqdm(train_loader, desc="Training"):
+
+        while global_step < args.steps:
+            model.train()
+            train_loss_accum = 0.0
+            train_metrics_accum = {k: 0.0 for k in ["mse", "mae", "corr_valence", "corr_arousal"]}
+            train_count_accum = 0
+            segment_len = min(segment_size, args.steps - global_step)
+            pbar = tqdm(total=segment_len, desc="Training", unit="step")
+            for _ in range(segment_len):
+                try:
+                    batch = next(batch_iter)
+                except StopIteration:
+                    batch_iter = iter(train_loader)
+                    batch = next(batch_iter)
                 if class_weights_tensor is not None:
                     w = class_weights_tensor[batch["emotion_index"]].to(device)
                 else:
@@ -306,65 +376,19 @@ if __name__ == "__main__":
                     sample_weights=w,
                 )
                 bs = len(batch["latents"])
-                train_loss += loss * bs
-                for k in train_metrics:
-                    train_metrics[k] += metrics[k] * bs
-                train_count += bs
-            train_loss /= train_count
-            for k in train_metrics:
-                train_metrics[k] /= train_count
-            logging.info(f"Train - Loss: {train_loss:.4f}, MSE: {train_metrics['mse']:.4f}, MAE: {train_metrics['mae']:.4f}, corr_v: {train_metrics['corr_valence']:.3f}, corr_a: {train_metrics['corr_arousal']:.3f}")
-
-            model.eval()
-            valid_loss = 0.0
-            valid_metrics = {k: 0.0 for k in train_metrics}
-            valid_count = 0
-            all_preds, all_va = [], []
-            with torch.no_grad():
-                for batch in tqdm(valid_loader, desc="Validating"):
-                    loss, metrics, (pred_np, va_np) = evaluate_batch_va(
-                        model, batch, loss_fn, device, return_predictions=True,
-                    )
-                    bs = len(batch["latents"])
-                    valid_loss += loss * bs
-                    for k in valid_metrics:
-                        valid_metrics[k] += metrics[k] * bs
-                    valid_count += bs
-                    all_preds.append(pred_np)
-                    all_va.append(va_np)
-            valid_loss /= valid_count
-            for k in valid_metrics:
-                valid_metrics[k] /= valid_count
-            all_preds = np.concatenate(all_preds, axis=0)
-            all_va = np.concatenate(all_va, axis=0)
-            logging.info(f"Valid - Loss: {valid_loss:.4f}, MSE: {valid_metrics['mse']:.4f}, MAE: {valid_metrics['mae']:.4f}, corr_v: {valid_metrics['corr_valence']:.3f}, corr_a: {valid_metrics['corr_arousal']:.3f}")
-
-            for split, loss_val, m in [("train", train_loss, train_metrics), ("valid", valid_loss, valid_metrics)]:
-                pd.DataFrame([{"epoch": epoch + 1, "split": split, "loss": loss_val, **m}]).to_csv(
-                    stats_file, mode="a", header=False, index=False
-                )
-            wandb.log({
-                "epoch": epoch + 1,
-                "train/loss": train_loss, "valid/loss": valid_loss,
-                **{f"train/{k}": v for k, v in train_metrics.items()},
-                **{f"valid/{k}": v for k, v in valid_metrics.items()},
-            })
-
-            if valid_metrics["mse"] < best_valid_mse:
-                best_valid_mse = valid_metrics["mse"]
-                best_metrics = valid_metrics.copy()
-                torch.save(model.state_dict(), best_model_path)
-                torch.save(optimizer.state_dict(), best_optimizer_path)
-                logging.info(f"Saved best model (valid MSE: {best_valid_mse:.4f})")
-                early_stopping_counter = 0
-            else:
-                early_stopping_counter += 1
-            if args.early_stopping and early_stopping_counter >= args.early_stopping_tolerance:
-                logging.info(f"Early stopping after {args.early_stopping_tolerance} epochs without improvement")
+                train_loss_accum += loss * bs
+                for k in train_metrics_accum:
+                    train_metrics_accum[k] += metrics[k] * bs
+                train_count_accum += bs
+                global_step += 1
+                pbar.update(1)
+            pbar.close()
+            run_validation()
+            if state["done"]:
                 break
 
-        logging.info(f"Fold {fold_k} complete. Best valid MSE: {best_valid_mse:.4f}")
-        logging.info(f"Best metrics: {best_metrics}")
+        logging.info(f"Fold {fold_k} complete. Best valid MSE: {state['best_valid_mse']:.4f}")
+        logging.info(f"Best metrics: {state['best_metrics']}")
         wandb.finish()
 
     logging.info("All training complete!")

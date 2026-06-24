@@ -1,0 +1,35 @@
+# Model A: causal transformer, bar latents only (no VA conditioning).
+# Combined training on DEAM + Memo2496 + MERP (sources skipped if not preprocessed).
+datasets: [deam, memo2496, merp]
+storage_dir: /deepfreeze/pnlong/gigamidi
+# Legacy paths (used for latent_dim inference fallback)
+latents_dir:  /deepfreeze/pnlong/gigamidi/deam_va/latents_musetok
+labels_path:  /deepfreeze/pnlong/gigamidi/deam_va/labels/deam_va_labels.json
+train_songs:  /deepfreeze/pnlong/gigamidi/deam_va/labels/train_songs.txt
+valid_songs:  /deepfreeze/pnlong/gigamidi/deam_va/labels/val_songs.txt
+# Architecture
+va_conditioning: false
+latent_dim:  128
+d_model:     128
+n_heads:     4
+n_layers:    2
+d_ff:        256
+dropout:     0.1
+max_len:     512
+# Training
+batch_size:               32
+learning_rate:            1e-4
+weight_decay:             1e-5
+steps:                    20000
+valid_steps:              1000
+early_stopping:           true
+early_stopping_tolerance: 10
+gpu:         true
+num_workers: 4
+# Loss objective
+target_mode:          absolute
+differential_weight:  0.0
+# Output
+output_dir:    /deepfreeze/pnlong/gigamidi/deam_va/checkpoints/trained_models
+model_name:    va_transformer_a
+wandb_project: gigamidi-support

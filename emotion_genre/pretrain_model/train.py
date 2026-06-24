@@ -148,12 +148,14 @@ def parse_args(args=None, namespace=None):
                        help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=1e-5,
                        help="Weight decay")
-    parser.add_argument("--epochs", type=int, default=100,
-                       help="Number of epochs")
+    parser.add_argument("--steps", type=int, default=10000,
+                       help="Total training steps. Data iterator resets when exhausted (next batch may be smaller, then full again).")
+    parser.add_argument("--valid_steps", type=int, default=1000,
+                       help="Run validation every N training steps (0 = only at end of training).")
     parser.add_argument("--early_stopping", action="store_true",
                        help="Enable early stopping")
     parser.add_argument("--early_stopping_tolerance", type=int, default=10,
-                       help="Early stopping patience")
+                       help="Stop after this many validations without improvement.")
     
     # Class imbalance
     parser.add_argument("--class_weight", type=str, default="balanced",
@@ -402,93 +404,69 @@ if __name__ == "__main__":
             optimizer.load_state_dict(torch.load(best_optimizer_path, map_location=device))
             logging.info("Resumed from checkpoint")
 
-        best_accuracy = 0.0
-        best_metrics = {}
-        stats_columns = ["epoch", "split", "loss", "accuracy", "f1_macro", "f1_weighted", "precision_macro", "recall_macro"]
+        state = {"best_accuracy": 0.0, "best_metrics": {}, "early_stopping_counter": 0, "done": False}
+        stats_columns = ["step", "split", "loss", "accuracy", "f1_macro", "f1_weighted", "precision_macro", "recall_macro"]
         if not os.path.exists(stats_file) or not args.resume:
             pd.DataFrame(columns=stats_columns).to_csv(stats_file, index=False)
 
-        early_stopping_counter = 0
+        segment_size = args.valid_steps if args.valid_steps > 0 else args.steps
+        global_step = 0
+        batch_iter = iter(train_loader)
 
-        for epoch in range(args.epochs):
-            logging.info(f"\nEpoch {epoch + 1}/{args.epochs}")
+        logging.info(f"Starting training for {args.steps} steps (fold {fold_k}). Validation every {args.valid_steps} steps." if args.valid_steps > 0 else f"Starting training for {args.steps} steps (fold {fold_k}). Validation at end only.")
 
-            model.train()
-            train_loss = 0.0
-            train_metrics = {k: 0.0 for k in ["accuracy", "f1_macro", "f1_weighted", "precision_macro", "recall_macro"]}
-            train_count = 0
-
-            for batch in tqdm(train_loader, desc="Training"):
-                loss, metrics = evaluate_batch(
-                    model, batch, loss_fn, device,
-                    update_parameters=True,
-                    optimizer=optimizer,
-                )
-                batch_size = len(batch["latents"])
-                train_loss += loss * batch_size
-                for k in train_metrics:
-                    train_metrics[k] += metrics[k] * batch_size
-                train_count += batch_size
-
-            train_loss /= train_count
-            for k in train_metrics:
-                train_metrics[k] /= train_count
-
-            logging.info(f"Train - Loss: {train_loss:.4f}, Accuracy: {train_metrics['accuracy']:.4f}, F1: {train_metrics['f1_macro']:.4f}")
-
+        def run_validation():
+            if train_count_accum == 0:
+                return
+            train_loss = train_loss_accum / train_count_accum
+            train_metrics = {k: train_metrics_accum[k] / train_count_accum for k in train_metrics_accum}
             model.eval()
             valid_loss = 0.0
             valid_metrics = {k: 0.0 for k in train_metrics.keys()}
             valid_count = 0
             all_preds = []
             all_labels = []
-
             with torch.no_grad():
-                for batch in tqdm(valid_loader, desc="Validating"):
-                    loss, metrics, (preds, labels) = evaluate_batch(
-                        model, batch, loss_fn, device,
+                for batch_v in valid_loader:
+                    loss_v, metrics_v, (preds, labels) = evaluate_batch(
+                        model, batch_v, loss_fn, device,
                         update_parameters=False,
                         return_predictions=True,
                     )
-                    batch_size = len(batch["latents"])
-                    valid_loss += loss * batch_size
+                    bv = len(batch_v["latents"])
+                    valid_loss += loss_v * bv
                     for k in valid_metrics:
-                        valid_metrics[k] += metrics[k] * batch_size
-                    valid_count += batch_size
+                        valid_metrics[k] += metrics_v[k] * bv
+                    valid_count += bv
                     all_preds.extend(preds.tolist())
                     all_labels.extend(labels.tolist())
-
             valid_loss /= valid_count
             for k in valid_metrics:
                 valid_metrics[k] /= valid_count
-
-            logging.info(f"Valid - Loss: {valid_loss:.4f}, Accuracy: {valid_metrics['accuracy']:.4f}, F1: {valid_metrics['f1_macro']:.4f}")
-
+            logging.info(f"Step {global_step} - Train Loss: {train_loss:.4f}, Valid Accuracy: {valid_metrics['accuracy']:.4f}, F1: {valid_metrics['f1_macro']:.4f}")
             for split, loss_val, metrics_dict in [("train", train_loss, train_metrics), ("valid", valid_loss, valid_metrics)]:
-                row = {"epoch": epoch + 1, "split": split, "loss": loss_val, **metrics_dict}
+                row = {"step": global_step, "split": split, "loss": loss_val, **metrics_dict}
                 pd.DataFrame([row]).to_csv(stats_file, mode="a", header=False, index=False)
-
             wandb.log({
-                "epoch": epoch + 1,
+                "step": global_step,
                 "train/loss": train_loss,
                 "valid/loss": valid_loss,
                 **{f"train/{k}": v for k, v in train_metrics.items()},
                 **{f"valid/{k}": v for k, v in valid_metrics.items()},
             })
-
-            if valid_metrics['accuracy'] > best_accuracy:
-                best_accuracy = valid_metrics['accuracy']
-                best_metrics = valid_metrics.copy()
+            if valid_metrics['accuracy'] > state['best_accuracy']:
+                state['best_accuracy'] = valid_metrics['accuracy']
+                state['best_metrics'] = valid_metrics.copy()
                 torch.save(model.state_dict(), best_model_path)
                 torch.save(optimizer.state_dict(), best_optimizer_path)
-                logging.info(f"Saved best model (accuracy: {best_accuracy:.4f})")
-                early_stopping_counter = 0
+                logging.info(f"Saved best model (accuracy: {state['best_accuracy']:.4f})")
+                state["early_stopping_counter"] = 0
                 cm = confusion_matrix(all_labels, all_preds, labels=list(range(args.num_classes)))
                 class_names = [index_to_class[i] for i in range(args.num_classes)]
                 plt.figure(figsize=(10, 8))
                 sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
                             xticklabels=class_names, yticklabels=class_names)
-                plt.title(f'Confusion Matrix - Epoch {epoch + 1}')
+                plt.title(f'Confusion Matrix - Step {global_step}')
                 plt.ylabel('True Label')
                 plt.xlabel('Predicted Label')
                 plt.tight_layout()
@@ -496,13 +474,43 @@ if __name__ == "__main__":
                 plt.savefig(cm_path, dpi=150)
                 plt.close()
             else:
-                early_stopping_counter += 1
+                state["early_stopping_counter"] += 1
+            if args.early_stopping and state["early_stopping_counter"] >= args.early_stopping_tolerance:
+                logging.info(f"Early stopping after {state['early_stopping_counter']} validations without improvement")
+                state["done"] = True
+            model.train()
 
-            if args.early_stopping and early_stopping_counter >= args.early_stopping_tolerance:
-                logging.info(f"Early stopping after {args.early_stopping_tolerance} epochs without improvement")
+        while global_step < args.steps:
+            model.train()
+            train_loss_accum = 0.0
+            train_metrics_accum = {k: 0.0 for k in ["accuracy", "f1_macro", "f1_weighted", "precision_macro", "recall_macro"]}
+            train_count_accum = 0
+            segment_len = min(segment_size, args.steps - global_step)
+            pbar = tqdm(total=segment_len, desc="Training", unit="step")
+            for _ in range(segment_len):
+                try:
+                    batch = next(batch_iter)
+                except StopIteration:
+                    batch_iter = iter(train_loader)
+                    batch = next(batch_iter)
+                loss, metrics = evaluate_batch(
+                    model, batch, loss_fn, device,
+                    update_parameters=True,
+                    optimizer=optimizer,
+                )
+                batch_size = len(batch["latents"])
+                train_loss_accum += loss * batch_size
+                for k in train_metrics_accum:
+                    train_metrics_accum[k] += metrics[k] * batch_size
+                train_count_accum += batch_size
+                global_step += 1
+                pbar.update(1)
+            pbar.close()
+            run_validation()
+            if state["done"]:
                 break
 
         logging.info(f"\nTraining complete (fold {fold_k})!")
-        logging.info(f"Best validation accuracy: {best_accuracy:.4f}")
-        logging.info(f"Best metrics: {best_metrics}")
+        logging.info(f"Best validation accuracy: {state['best_accuracy']:.4f}")
+        logging.info(f"Best metrics: {state['best_metrics']}")
         wandb.finish()
