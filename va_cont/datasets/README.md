@@ -16,4 +16,6 @@ ds = get_dataset("deam")  # or "memo2496", "merp"
 v, a = ds.load_audio_va_annotations("1000")  # {time_sec: value} dicts
 ```
 
-Implementation details that differ by dataset (especially MERP annotation source choice) are documented in the pipeline methodology section, not duplicated here.
+**Overlap policy:** MERP tracks that overlap DEAM anchor songs are excluded from MERP splits via [`leakage.py`](leakage.py) (`deam_115`, `deam_343`, `deam_745`, `deam_1334`). DEAM keeps the numeric IDs only.
+
+See [../PIPELINE.md](../PIPELINE.md#merp) for the full MERP annotation pipeline.

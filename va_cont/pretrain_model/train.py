@@ -8,9 +8,10 @@ Two model variants (ablation):
       bar's V/A prediction (teacher-forced during training).
 
 WandB metrics:
-  valid/mse, valid/mae: Lower is better.
-  valid/corr_valence, valid/corr_arousal: Pearson r, closer to 1 is better.
-  Best model saved by valid/mse.
+  valid/mse, valid/mae: Lower is better (teacher-forced for Model B).
+  Model B also logs valid/ar_mse, valid/ar_mae (autoregressive inference).
+  valid/corr_valence, valid/corr_arousal: Pearson r; Model B uses AR only.
+  Best checkpoint: valid/ar_mse for Model B, valid/mse for Model A.
 """
 
 import argparse
@@ -176,6 +177,62 @@ def evaluate_batch(
     if return_predictions:
         return loss_value, metrics, (p, t)
     return loss_value, metrics
+
+
+def _pearson_corr(pred: np.ndarray, target: np.ndarray) -> tuple[float, float]:
+    """Pearson r for valence (col 0) and arousal (col 1)."""
+    if pred.shape[0] < 2:
+        return 0.0, 0.0
+    rv = float(np.corrcoef(pred[:, 0], target[:, 0])[0, 1])
+    ra = float(np.corrcoef(pred[:, 1], target[:, 1])[0, 1])
+    return (0.0 if np.isnan(rv) else rv, 0.0 if np.isnan(ra) else ra)
+
+
+def evaluate_autoregressive(
+    model: CausalVATransformer,
+    loader: torch.utils.data.DataLoader,
+    device: torch.device,
+) -> dict:
+    """
+    Autoregressive validation for Model B (no teacher forcing).
+
+    Returns dict with mse, mae, corr_valence, corr_arousal over all labeled bars.
+    """
+    model.eval()
+    all_preds: list[np.ndarray] = []
+    all_targets: list[np.ndarray] = []
+
+    with torch.no_grad():
+        for batch in loader:
+            latents = batch["latents"].to(device)
+            targets = batch["va_targets"].to(device)
+            mask = batch["label_mask"].to(device)
+            padding_mask = batch["padding_mask"].to(device)
+            for b in range(latents.shape[0]):
+                seq_len = int((~padding_mask[b]).sum().item())
+                if seq_len == 0:
+                    continue
+                pred = model.infer_sequential(latents[b : b + 1, :seq_len])
+                bar_mask = mask[b, :seq_len]
+                if not bar_mask.any():
+                    continue
+                all_preds.append(pred[bar_mask].cpu().numpy())
+                all_targets.append(targets[b, :seq_len][bar_mask].cpu().numpy())
+
+    if not all_preds:
+        return {"mse": 0.0, "mae": 0.0, "corr_valence": 0.0, "corr_arousal": 0.0}
+
+    p_all = np.concatenate(all_preds, axis=0)
+    t_all = np.concatenate(all_targets, axis=0)
+    mse = float(((p_all - t_all) ** 2).mean())
+    mae = float(np.abs(p_all - t_all).mean())
+    corr_v, corr_a = _pearson_corr(p_all, t_all)
+    return {
+        "mse": mse,
+        "mae": mae,
+        "corr_valence": corr_v,
+        "corr_arousal": corr_a,
+    }
 
 
 def parse_args():
@@ -440,7 +497,10 @@ if __name__ == "__main__":
         optimizer.load_state_dict(torch.load(best_optimizer_path, map_location=device))
         logging.info("Resumed from checkpoint")
 
-    stats_columns = ["step", "epoch", "split", "loss", "mse", "mae", "corr_valence", "corr_arousal"]
+    stats_columns = [
+        "step", "epoch", "split", "loss", "mse", "mae",
+        "ar_mse", "ar_mae", "corr_valence", "corr_arousal",
+    ]
     if not os.path.exists(stats_file) or not args.resume:
         pd.DataFrame(columns=stats_columns).to_csv(stats_file, index=False)
 
@@ -482,44 +542,91 @@ if __name__ == "__main__":
                 all_preds.append(pv)
                 all_targets.append(tv)
 
+        ar_metrics = None
+        if args.va_conditioning:
+            ar_metrics = evaluate_autoregressive(model, valid_loader, device)
+
         if valid_count:
             valid_loss /= valid_count
             for k in valid_metrics:
                 valid_metrics[k] /= valid_count
-            # Recompute global Pearson r over all labeled validation bars
-            p_all = np.concatenate(all_preds,   axis=0)
-            t_all = np.concatenate(all_targets, axis=0)
-            if p_all.shape[0] > 1:
-                rv = float(np.corrcoef(p_all[:, 0], t_all[:, 0])[0, 1])
-                ra = float(np.corrcoef(p_all[:, 1], t_all[:, 1])[0, 1])
-                valid_metrics["corr_valence"]  = 0.0 if np.isnan(rv) else rv
-                valid_metrics["corr_arousal"]  = 0.0 if np.isnan(ra) else ra
+            if not args.va_conditioning:
+                p_all = np.concatenate(all_preds, axis=0)
+                t_all = np.concatenate(all_targets, axis=0)
+                if p_all.shape[0] > 1:
+                    rv, ra = _pearson_corr(p_all, t_all)
+                    valid_metrics["corr_valence"] = rv
+                    valid_metrics["corr_arousal"] = ra
 
         epoch = global_step / steps_per_epoch
-        logging.info(
-            f"Step {global_step} (epoch {epoch:.2f}) — Train Loss: {train_loss:.4f} | "
-            f"Valid MSE: {valid_metrics['mse']:.4f}, "
-            f"corr_v: {valid_metrics['corr_valence']:.3f}, "
-            f"corr_a: {valid_metrics['corr_arousal']:.3f}"
-        )
+        if args.va_conditioning and ar_metrics:
+            logging.info(
+                f"Step {global_step} (epoch {epoch:.2f}) — Train Loss: {train_loss:.4f} | "
+                f"Valid TF MSE: {valid_metrics['mse']:.4f} | "
+                f"Valid AR MSE: {ar_metrics['mse']:.4f}, "
+                f"corr_v: {ar_metrics['corr_valence']:.3f}, "
+                f"corr_a: {ar_metrics['corr_arousal']:.3f}"
+            )
+        else:
+            logging.info(
+                f"Step {global_step} (epoch {epoch:.2f}) — Train Loss: {train_loss:.4f} | "
+                f"Valid MSE: {valid_metrics['mse']:.4f}, "
+                f"corr_v: {valid_metrics['corr_valence']:.3f}, "
+                f"corr_a: {valid_metrics['corr_arousal']:.3f}"
+            )
+
         for split, lv, m in [("train", train_loss, train_metrics),
                               ("valid", valid_loss, valid_metrics)]:
-            pd.DataFrame([{
-                "step": global_step, "epoch": epoch, "split": split, "loss": lv, **m,
-            }]).to_csv(stats_file, mode="a", header=False, index=False)
-        wandb.log({
-            "epoch": epoch,
-            "train/loss": train_loss, "valid/loss": valid_loss,
-            **{f"train/{k}": v for k, v in train_metrics.items()},
-            **{f"valid/{k}": v for k, v in valid_metrics.items()},
-        }, step=global_step)
+            row = {
+                "step": global_step, "epoch": epoch, "split": split,
+                "loss": lv, **m,
+                "ar_mse": np.nan, "ar_mae": np.nan,
+            }
+            if split == "valid" and ar_metrics:
+                row["ar_mse"] = ar_metrics["mse"]
+                row["ar_mae"] = ar_metrics["mae"]
+                row["corr_valence"] = ar_metrics["corr_valence"]
+                row["corr_arousal"] = ar_metrics["corr_arousal"]
+            elif split == "valid" and args.va_conditioning:
+                row["corr_valence"] = np.nan
+                row["corr_arousal"] = np.nan
+            pd.DataFrame([row]).to_csv(stats_file, mode="a", header=False, index=False)
 
-        if valid_metrics["mse"] < state["best_valid_mse"]:
-            state["best_valid_mse"] = valid_metrics["mse"]
-            state["best_metrics"]   = valid_metrics.copy()
+        wandb_payload = {
+            "epoch": epoch,
+            "train/loss": train_loss,
+            "valid/loss": valid_loss,
+            "train/mse": train_metrics["mse"],
+            "train/mae": train_metrics["mae"],
+            "valid/mse": valid_metrics["mse"],
+            "valid/mae": valid_metrics["mae"],
+        }
+        if args.va_conditioning:
+            if ar_metrics:
+                wandb_payload["valid/ar_mse"] = ar_metrics["mse"]
+                wandb_payload["valid/ar_mae"] = ar_metrics["mae"]
+                wandb_payload["valid/corr_valence"] = ar_metrics["corr_valence"]
+                wandb_payload["valid/corr_arousal"] = ar_metrics["corr_arousal"]
+        else:
+            wandb_payload["train/corr_valence"] = train_metrics["corr_valence"]
+            wandb_payload["train/corr_arousal"] = train_metrics["corr_arousal"]
+            wandb_payload["valid/corr_valence"] = valid_metrics["corr_valence"]
+            wandb_payload["valid/corr_arousal"] = valid_metrics["corr_arousal"]
+        wandb.log(wandb_payload, step=global_step)
+
+        checkpoint_mse = (
+            ar_metrics["mse"] if args.va_conditioning and ar_metrics else valid_metrics["mse"]
+        )
+        if checkpoint_mse < state["best_valid_mse"]:
+            state["best_valid_mse"] = checkpoint_mse
+            state["best_metrics"] = (
+                {**valid_metrics, **{f"ar_{k}": v for k, v in ar_metrics.items()}}
+                if ar_metrics else valid_metrics.copy()
+            )
             torch.save(model.state_dict(),     best_model_path)
             torch.save(optimizer.state_dict(), best_optimizer_path)
-            logging.info(f"Saved best model (valid MSE: {state['best_valid_mse']:.4f})")
+            label = "AR MSE" if args.va_conditioning else "MSE"
+            logging.info(f"Saved best model (valid {label}: {state['best_valid_mse']:.4f})")
             state["early_stopping_counter"] = 0
         else:
             state["early_stopping_counter"] += 1

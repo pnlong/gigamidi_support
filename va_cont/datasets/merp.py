@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 
 from datasets.base import VADatasetSource
-from datasets.deam import MERP_DEAM_ANCHOR_IDS
+from datasets.leakage import MERP_DEAM_ANCHOR_SONG_IDS
 
 
 class MERPDataset(VADatasetSource):
@@ -234,9 +234,9 @@ class MERPDataset(VADatasetSource):
         return 10.0
 
     def excluded_song_ids(self) -> set[str]:
-        """Exclude DEAM anchor tracks from MERP splits (identified in songs.json)."""
+        """Exclude DEAM anchor tracks from MERP splits (overlap with DEAM)."""
         self._load_manifest()
-        excluded = set(MERP_DEAM_ANCHOR_IDS)
+        excluded = set(MERP_DEAM_ANCHOR_SONG_IDS)
         for entry in self._manifest:
             if entry.get("deam_anchor") or entry.get("source") == "deam":
                 excluded.add(str(entry.get("id", entry.get("song_id"))))

@@ -218,7 +218,9 @@ The MERP paper's filtered split applies 7 QC steps. **Step 6 trims each rater's 
 
 **Overlap / splits:**
 
-- 4 MERP tracks are DEAM anchor songs (`deam_*` IDs). These are **excluded from MERP train/val/test** via `excluded_song_ids()` and optional `songs.json` `"deam_anchor": true` flags, so they are not double-counted when training on DEAM + MERP combined.
+- 4 MERP tracks duplicate DEAM MEMD excerpts (`deam_115`, `deam_343`, `deam_745`, `deam_1334`).
+- These are **blacklisted from all MERP splits** via [`datasets/leakage.py`](datasets/leakage.py) and `MERPDataset.excluded_song_ids()` so the same audio never appears in both DEAM train and MERP val (or vice versa).
+- DEAM numeric IDs (`115`, `343`, …) remain in DEAM splits only.
 
 **Derived paths:**
 

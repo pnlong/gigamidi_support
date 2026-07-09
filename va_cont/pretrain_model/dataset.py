@@ -199,6 +199,7 @@ def build_dataset_for_source(
     Returns None if required files are missing.
     """
     from datasets import get_dataset
+    from datasets.leakage import filter_songs_for_combined_training
 
     ds = get_dataset(name, storage_dir)
     split_path = ds.train_songs_path() if split == "train" else ds.valid_songs_path()
@@ -212,6 +213,9 @@ def build_dataset_for_source(
 
     with open(split_path) as f:
         song_list = [line.strip() for line in f if line.strip()]
+    song_list = filter_songs_for_combined_training(name, song_list)
+    if not song_list:
+        return None
 
     labels_path = str(ds.bar_labels_cache_path()) if ds.bar_labels_cache_path().is_file() else None
     continuous_dir = str(ds.continuous_dir()) if ds.continuous_dir().is_dir() else None

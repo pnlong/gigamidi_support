@@ -8,10 +8,8 @@ from pathlib import Path
 import pandas as pd
 
 from datasets.base import VADatasetSource
+from datasets.leakage import MERP_DEAM_ANCHOR_IDS
 from va_utils import parse_sample_ms_columns
-
-# MERP DEAM anchor IDs — populate via merp/songs.json "deam_anchor": true entries
-MERP_DEAM_ANCHOR_IDS: set[str] = set()
 
 
 class DEAMDataset(VADatasetSource):
