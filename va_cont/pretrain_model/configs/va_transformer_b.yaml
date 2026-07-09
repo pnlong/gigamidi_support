@@ -24,6 +24,8 @@ gpu:         true
 num_workers: 4
 target_mode:          absolute
 differential_weight:  0.0
+va_jitter_std:        0.05
+va_label_dropout:     0.1
 output_dir:    /deepfreeze/pnlong/gigamidi/deam_va/checkpoints/trained_models
 model_name:    va_transformer_b
 wandb_project: gigamidi-support

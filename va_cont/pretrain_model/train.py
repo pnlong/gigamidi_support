@@ -10,7 +10,7 @@ Two model variants (ablation):
 WandB metrics:
   valid/mse, valid/mae: Lower is better (teacher-forced for Model B).
   Model B also logs valid/ar_mse, valid/ar_mae (autoregressive inference).
-  valid/corr_valence, valid/corr_arousal: Pearson r; Model B uses AR only.
+  valid/corr_valence, valid/corr_arousal: Pearson r; Model B uses AR only (not logged for train).
   Best checkpoint: valid/ar_mse for Model B, valid/mse for Model A.
 """
 
@@ -104,6 +104,40 @@ def _compute_differential_loss(
     return loss_fn(torch.cat(diff_p, dim=0), torch.cat(diff_t, dim=0))
 
 
+def augment_va_training(
+    va_targets: torch.Tensor,
+    label_mask: torch.BoolTensor,
+    jitter_std: float = 0.0,
+    label_dropout: float = 0.0,
+) -> tuple[torch.Tensor, torch.BoolTensor]:
+    """
+    Training-only label regularization: Gaussian jitter + random bar dropout.
+
+    Jitter is applied on labeled bars and clamped to [-1, 1]. Label dropout
+    randomly removes bars from the loss (Model B falls back to null_va for
+    dropped predecessors). Each song keeps at least one labeled bar.
+    """
+    va_aug = va_targets
+    mask_aug = label_mask
+
+    if jitter_std > 0.0:
+        va_aug = va_targets.clone()
+        noise = torch.randn_like(va_aug) * jitter_std
+        labeled = mask_aug.unsqueeze(-1).expand_as(va_aug)
+        va_aug = torch.where(labeled, (va_aug + noise).clamp(-1.0, 1.0), va_aug)
+
+    if label_dropout > 0.0:
+        mask_aug = label_mask.clone()
+        drop = (torch.rand_like(mask_aug.float()) < label_dropout) & mask_aug
+        mask_aug = mask_aug & ~drop
+        for b in range(mask_aug.shape[0]):
+            if label_mask[b].any() and not mask_aug[b].any():
+                idx = label_mask[b].nonzero(as_tuple=True)[0]
+                mask_aug[b, idx[torch.randint(len(idx), (1,), device=idx.device)]] = True
+
+    return va_aug, mask_aug
+
+
 def evaluate_batch(
     model: nn.Module,
     batch: dict,
@@ -114,6 +148,8 @@ def evaluate_batch(
     return_predictions: bool = False,
     target_mode: str = "absolute",
     differential_weight: float = 0.0,
+    va_jitter_std: float = 0.0,
+    va_label_dropout: float = 0.0,
 ):
     """
     Forward pass, optional backward pass, and metrics.
@@ -128,11 +164,19 @@ def evaluate_batch(
         differential_weight:  Only used when target_mode="absolute". When > 0, adds a
                               differential MSE term:
                               loss = (1 - w)*MSE_abs + w*MSE_diff.
+        va_jitter_std:        Gaussian noise std on labeled V/A during training (0=off).
+        va_label_dropout:     Probability of dropping each labeled bar from the loss
+                              during training (0=off).
     """
     latents      = batch["latents"].to(device)       # (B, T, 128)
     va_targets   = batch["va_targets"].to(device)    # (B, T, 2)
     label_mask   = batch["label_mask"].to(device)    # (B, T) bool
     padding_mask = batch["padding_mask"].to(device)  # (B, T) bool
+
+    if update_parameters and (va_jitter_std > 0.0 or va_label_dropout > 0.0):
+        va_targets, label_mask = augment_va_training(
+            va_targets, label_mask, va_jitter_std, va_label_dropout,
+        )
 
     if update_parameters:
         optimizer.zero_grad()
@@ -173,7 +217,8 @@ def evaluate_batch(
         corr_v = 0.0 if np.isnan(corr_v) else corr_v
         corr_a = 0.0 if np.isnan(corr_a) else corr_a
 
-    metrics = {"mse": mse, "mae": mae, "corr_valence": corr_v, "corr_arousal": corr_a}
+    metrics = {"mse": mse, "mae": mae, "corr_valence": corr_v, "corr_arousal": corr_a,
+               "n_labeled": int(label_mask.sum().item())}
     if return_predictions:
         return loss_value, metrics, (p, t)
     return loss_value, metrics
@@ -302,6 +347,12 @@ def parse_args():
     parser.add_argument("--differential_weight", type=float, default=0.0,
                         help="Only used when target_mode=absolute. Weight w in "
                              "loss = (1-w)*MSE_abs + w*MSE_diff. Default 0 (pure absolute).")
+    parser.add_argument("--va_jitter_std", type=float, default=0.05,
+                        help="Gaussian noise std added to labeled V/A during training "
+                             "(clamped to [-1,1]). 0 disables.")
+    parser.add_argument("--va_label_dropout", type=float, default=0.1,
+                        help="Per-bar probability of dropping a labeled bar from the "
+                             "training loss. 0 disables.")
     # Checkpointing / logging
     parser.add_argument("--output_dir",    type=str, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--model_name",    type=str, default="va_transformer_a")
@@ -469,6 +520,12 @@ if __name__ == "__main__":
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     logging.info(f"Model parameters: {n_params:,}")
+    logging.info(f"Transformer dropout: {args.dropout}")
+    if args.va_jitter_std > 0.0 or args.va_label_dropout > 0.0:
+        logging.info(
+            f"VA label regularization (train only): "
+            f"jitter_std={args.va_jitter_std}, label_dropout={args.va_label_dropout}"
+        )
 
     loss_fn   = nn.MSELoss(reduction="mean")
     optimizer = torch.optim.AdamW(
@@ -663,9 +720,10 @@ if __name__ == "__main__":
                 update_parameters=True, optimizer=optimizer,
                 target_mode=args.target_mode,
                 differential_weight=args.differential_weight,
+                va_jitter_std=args.va_jitter_std,
+                va_label_dropout=args.va_label_dropout,
             )
-            # Count labeled bars in batch (not songs) for accurate metric accumulation
-            n = int(batch["label_mask"].sum().item())
+            n = metrics.get("n_labeled", int(batch["label_mask"].sum().item()))
             if n > 0:
                 train_loss_accum += loss * n
                 for k in train_metrics_accum:
