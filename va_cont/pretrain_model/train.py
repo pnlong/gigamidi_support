@@ -221,8 +221,16 @@ def parse_args():
                         help="Songs per batch")
     parser.add_argument("--learning_rate",           type=float, default=1e-4)
     parser.add_argument("--weight_decay",            type=float, default=1e-5)
-    parser.add_argument("--steps",                   type=int,   default=20000)
-    parser.add_argument("--valid_steps",             type=int,   default=1000)
+    parser.add_argument("--epochs", type=int, default=None,
+                        help="Train for this many full passes over the training set. "
+                             "Overrides --steps when set (computed after DataLoader is built).")
+    parser.add_argument("--valid_every_epochs", type=float, default=1.0,
+                        help="Run validation every N epochs (only when --epochs is set). "
+                             "Default 1.0 = validate once per epoch.")
+    parser.add_argument("--steps",                   type=int,   default=20000,
+                        help="Total optimizer steps (gradient updates). Ignored if --epochs is set.")
+    parser.add_argument("--valid_steps",             type=int,   default=1000,
+                        help="Validate every N optimizer steps (ignored if --epochs is set).")
     parser.add_argument("--early_stopping",          action="store_true")
     parser.add_argument("--early_stopping_tolerance",type=int,   default=10)
     parser.add_argument("--gpu",                     action="store_true")
@@ -379,6 +387,19 @@ if __name__ == "__main__":
         collate_fn=CombinedVASequenceDataset.collate_fn,
     )
 
+    steps_per_epoch = max(1, len(train_loader))
+    if args.epochs is not None:
+        args.steps = int(args.epochs * steps_per_epoch)
+        args.valid_steps = max(1, int(args.valid_every_epochs * steps_per_epoch))
+        logging.info(
+            f"Epoch mode: {args.epochs} epochs × {steps_per_epoch} steps/epoch "
+            f"→ {args.steps} total steps, validate every {args.valid_steps} steps "
+            f"({args.valid_every_epochs:g} epoch(s))"
+        )
+    else:
+        logging.info(f"Step mode: {args.steps} total steps, {steps_per_epoch} steps/epoch "
+                     f"(≈{args.steps / steps_per_epoch:.1f} epochs)")
+
     model = CausalVATransformer(
         latent_dim=args.latent_dim,
         d_model=args.d_model,
@@ -419,7 +440,7 @@ if __name__ == "__main__":
         optimizer.load_state_dict(torch.load(best_optimizer_path, map_location=device))
         logging.info("Resumed from checkpoint")
 
-    stats_columns = ["step", "split", "loss", "mse", "mae", "corr_valence", "corr_arousal"]
+    stats_columns = ["step", "epoch", "split", "loss", "mse", "mae", "corr_valence", "corr_arousal"]
     if not os.path.exists(stats_file) or not args.resume:
         pd.DataFrame(columns=stats_columns).to_csv(stats_file, index=False)
 
@@ -474,23 +495,24 @@ if __name__ == "__main__":
                 valid_metrics["corr_valence"]  = 0.0 if np.isnan(rv) else rv
                 valid_metrics["corr_arousal"]  = 0.0 if np.isnan(ra) else ra
 
+        epoch = global_step / steps_per_epoch
         logging.info(
-            f"Step {global_step} — Train Loss: {train_loss:.4f} | "
+            f"Step {global_step} (epoch {epoch:.2f}) — Train Loss: {train_loss:.4f} | "
             f"Valid MSE: {valid_metrics['mse']:.4f}, "
             f"corr_v: {valid_metrics['corr_valence']:.3f}, "
             f"corr_a: {valid_metrics['corr_arousal']:.3f}"
         )
         for split, lv, m in [("train", train_loss, train_metrics),
                               ("valid", valid_loss, valid_metrics)]:
-            pd.DataFrame([{"step": global_step, "split": split, "loss": lv, **m}]).to_csv(
-                stats_file, mode="a", header=False, index=False
-            )
+            pd.DataFrame([{
+                "step": global_step, "epoch": epoch, "split": split, "loss": lv, **m,
+            }]).to_csv(stats_file, mode="a", header=False, index=False)
         wandb.log({
-            "step": global_step,
+            "epoch": epoch,
             "train/loss": train_loss, "valid/loss": valid_loss,
             **{f"train/{k}": v for k, v in train_metrics.items()},
             **{f"valid/{k}": v for k, v in valid_metrics.items()},
-        })
+        }, step=global_step)
 
         if valid_metrics["mse"] < state["best_valid_mse"]:
             state["best_valid_mse"] = valid_metrics["mse"]

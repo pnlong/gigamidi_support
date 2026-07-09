@@ -110,8 +110,78 @@ class MERPDataset(VADatasetSource):
         from va_utils import parse_sample_ms_columns
         return parse_sample_ms_columns(pd.read_csv(path))
 
+    def _arrays_to_time_dict(self, values: list[float], hz: float = 10.0) -> dict[float, float]:
+        return {i / hz: float(v) for i, v in enumerate(values)}
+
+    @staticmethod
+    def _rescale_rater_series(series: np.ndarray) -> np.ndarray:
+        """Per-rater min-max to [-1, 1] (MERP filtered pipeline step)."""
+        lo, hi = float(series.min()), float(series.max())
+        if hi <= lo:
+            return series
+        return 2.0 * (series - lo) / (hi - lo) - 1.0
+
+    def _average_rater_series(
+        self,
+        series_list: list,
+        *,
+        rescale_per_rater: bool = False,
+    ) -> list[float]:
+        """
+        Mean across raters at 10 Hz.
+
+        Drops trials shorter than 80% of the per-song median length, then aligns
+        to the median kept length (avoids one short rater truncating full songs).
+        """
+        arrays = [np.asarray(s, dtype=np.float64) for s in series_list if len(s) > 0]
+        if not arrays:
+            return []
+        if rescale_per_rater:
+            arrays = [self._rescale_rater_series(a) for a in arrays]
+
+        median_len = int(np.median([a.shape[0] for a in arrays]))
+        min_accept = int(0.8 * median_len)
+        arrays = [a for a in arrays if a.shape[0] >= min_accept]
+        if not arrays:
+            return []
+
+        target_len = int(np.median([a.shape[0] for a in arrays]))
+        arrays = [a for a in arrays if a.shape[0] >= target_len]
+        if not arrays:
+            return []
+        stacked = np.stack([a[:target_len] for a in arrays], axis=0)
+        return stacked.mean(axis=0).tolist()
+
+    def _load_hf_parquet_annotations(self, path: Path, *, rescale_per_rater: bool = False):
+        df = pd.read_parquet(path)
+        if "song_id" not in df.columns or "valence" not in df.columns or "arousal" not in df.columns:
+            raise ValueError(f"Unexpected schema in {path}")
+
+        self._valence_by_song = {}
+        self._arousal_by_song = {}
+        for song_id, group in df.groupby("song_id"):
+            sid = str(song_id)
+            rescale = rescale_per_rater
+            v_avg = self._average_rater_series(group["valence"].tolist(), rescale_per_rater=rescale)
+            a_avg = self._average_rater_series(group["arousal"].tolist(), rescale_per_rater=rescale)
+            if v_avg and a_avg:
+                self._valence_by_song[sid] = self._arrays_to_time_dict(v_avg)
+                self._arousal_by_song[sid] = self._arrays_to_time_dict(a_avg)
+
     def _ensure_annotations_loaded(self):
         if self._valence_by_song is not None:
+            return
+
+        # HuggingFace MERP layout: parquet at dataset root.
+        # Prefer raw for full-song V/A (filtered is segment-trimmed ~15–20% of audio).
+        raw_path = self.base_dir / "annotations_raw.parquet"
+        if raw_path.is_file():
+            self._load_hf_parquet_annotations(raw_path, rescale_per_rater=True)
+            return
+
+        filtered_path = self.base_dir / "annotations_filtered.parquet"
+        if filtered_path.is_file():
+            self._load_hf_parquet_annotations(filtered_path, rescale_per_rater=False)
             return
 
         v_long = self.annotations_dir / "averaged_valence.parquet"

@@ -15,13 +15,23 @@ REPO_URL="https://huggingface.co/spaces/mimbres/YourMT3"
 
 echo "Installing YourMT3+ to ${INSTALL_DIR}"
 
+if ! command -v git-lfs >/dev/null 2>&1; then
+    echo "ERROR: git-lfs is required (YourMT3 checkpoints are stored via LFS)."
+    echo "Install with one of:"
+    echo "  sudo apt-get install git-lfs && git lfs install"
+    echo "  mamba install -n gigamidi -c conda-forge git-lfs && git lfs install"
+    echo "Then re-run this script (activate gigamidi first if git-lfs came from mamba)."
+    exit 1
+fi
+
+git lfs install --skip-repo 2>/dev/null || true
+
 if [ -d "${INSTALL_DIR}/.git" ]; then
     echo "Repo exists — pulling latest + LFS..."
     cd "${INSTALL_DIR}"
     git pull
     git lfs pull
 else
-    git lfs install --skip-repo 2>/dev/null || true
     git clone "${REPO_URL}" "${INSTALL_DIR}"
     cd "${INSTALL_DIR}"
     git lfs pull

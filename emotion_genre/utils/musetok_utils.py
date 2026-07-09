@@ -442,6 +442,43 @@ def events_to_remi_tokens(events: List[Dict], vocab: dict) -> np.ndarray:
     return tokens
 
 
+def _filter_events_for_musetok(events: List[Dict], bar_positions: List[int], vocab: dict, filter_velocity: bool = False):
+    """Filter REMI events to MuseTok vocabulary and return updated bar positions."""
+    original_len = len(events)
+    filtered_events = []
+
+    for e in events:
+        if isinstance(e, dict):
+            event_name = e.get("name", "")
+            event_value = e.get("value")
+
+            if event_name not in ["Bar", "Beat", "EOS", "Note_Pitch", "Note_Duration", "Note_Velocity", "Time_Signature"]:
+                continue
+            if event_name.startswith("Chord"):
+                continue
+            if filter_velocity and event_name.startswith("Note_Velocity"):
+                continue
+            if isinstance(event_value, (tuple, list, dict)):
+                continue
+            try:
+                event_key = f"{event_name}_{event_value if event_value is not None else 'None'}"
+                if event_key not in vocab:
+                    continue
+            except (TypeError, ValueError):
+                continue
+        filtered_events.append(e)
+
+    if len(filtered_events) != original_len:
+        piece_bar_pos = [
+            i for i, event in enumerate(filtered_events)
+            if isinstance(event, dict) and event.get("name") == "Bar"
+        ]
+    else:
+        piece_bar_pos = bar_positions.copy()
+
+    return filtered_events, piece_bar_pos
+
+
 def extract_latents_from_events(events: List[Dict], 
                                 bar_positions: List[int],
                                 encoder: MuseTokEncoder,
@@ -464,84 +501,115 @@ def extract_latents_from_events(events: List[Dict],
     Returns:
         latents: numpy array of shape (n_bars, d_vae_latent) where d_vae_latent=128
     """
-    # Filter events that are not in the vocabulary
-    # Chord events are not in MuseTok vocabulary (they're excluded for emotion prediction)
-    # Velocity events may also need filtering if vocabulary doesn't support them
-    # Some Beat and Duration values from REMI data may also not be in vocabulary
-    original_len = len(events)
-    filtered_events = []
-    skipped_events = []
-    
-    for e in events:
-        if isinstance(e, dict):
-            event_name = e.get('name', '')
-            event_value = e.get('value')
-            
-            # Filter out non-standard events (like Emotion)
-            if event_name not in ['Bar', 'Beat', 'EOS', 'Note_Pitch', 'Note_Duration', 'Note_Velocity', 'Time_Signature']:
-                # Skip events like Emotion, Chord, etc.
-                continue
-            
-            # Filter Chord events (not in vocabulary, not needed for emotion prediction)
-            if event_name.startswith('Chord'):
-                continue
-            
-            # Filter velocity events if needed
-            if filter_velocity and event_name.startswith('Note_Velocity'):
-                continue
-            
-            # CRITICAL: Filter out events with tuple/list/dict values BEFORE they reach convert_event
-            # These cause "'<' not supported between instances of 'tuple' and 'int'" errors
-            # when convert_event tries to process them internally
-            if isinstance(event_value, (tuple, list, dict)):
-                skipped_events.append(f"{event_name}_{type(event_value).__name__}")
-                continue
-            
-            # Handle event value - convert to string safely
-            try:
-                if event_value is None:
-                    event_key = f"{event_name}_None"
-                else:
-                    event_key = f"{event_name}_{event_value}"
-                
-                # Check if event is in vocabulary
-                if event_key not in vocab:
-                    # Event not in vocabulary - skip it
-                    skipped_events.append(event_key)
-                    continue
-            except (TypeError, ValueError) as ex:
-                # Skip events with problematic values
-                skipped_events.append(f"{event_name}_<error>")
-                continue
-        
-        filtered_events.append(e)
-    
-    events = filtered_events
-    
-    # Log skipped events if any (but only for first few to avoid spam)
-    if skipped_events and len(skipped_events) <= 5:
-        logging.debug(f"Skipped {len(skipped_events)} events not in vocabulary: {skipped_events[:5]}")
-    
-    # Recalculate bar positions after filtering (if we filtered anything)
-    if len(events) != original_len:
-        piece_bar_pos = []
-        for i, event in enumerate(events):
-            if isinstance(event, dict) and event.get('name') == 'Bar':
-                piece_bar_pos.append(i)
-    else:
-        # Prepare bar_positions (make a copy to avoid modifying original)
-        piece_bar_pos = bar_positions.copy()
-    
-    # Get segments (handles >16 bars automatically)
-    # This splits the song into segments of 16 bars each
+    events, piece_bar_pos = _filter_events_for_musetok(events, bar_positions, vocab, filter_velocity)
     music_data = encoder.get_segments(events, piece_bar_pos)
-    
-    # Extract latents using encoder
-    # This processes all segments and returns latents for all bars
-    indices, latents = encoder.encoding(music_data, return_latents=True)
-    
-    # latents shape: (n_bars, d_vae_latent) where d_vae_latent=128
+    _, latents = encoder.encoding(music_data, return_latents=True)
     return latents
+
+
+def _forward_segment_batch(encoder: MuseTokEncoder, enc_inp: np.ndarray, enc_padding_mask: np.ndarray) -> np.ndarray:
+    """Run MuseTok encoder on a batch of 16-bar segments. Shapes: (B, 16, seqlen)."""
+    device = encoder.device
+    enc_t = torch.from_numpy(enc_inp).to(device).permute(2, 0, 1).long()
+    mask_t = torch.from_numpy(enc_padding_mask).to(device).bool()
+    with torch.no_grad():
+        latents, _ = encoder.model.get_batch_latent(enc_t, mask_t, latent_from_encoder=False)
+    return latents.detach().cpu().numpy()
+
+
+def _latents_from_music_data(encoder: MuseTokEncoder, music_data: dict, segment_batch_size: int) -> np.ndarray:
+    """Encode one song's segments, optionally chunking the GPU forward pass."""
+    n_bar = music_data["n_bar"]
+    n_segment = music_data["n_segment"]
+    enc_inp = music_data["enc_inp"]
+    enc_padding_mask = music_data["enc_padding_mask"]
+
+    seg_latents = []
+    for st in range(0, n_segment, segment_batch_size):
+        ed = min(st + segment_batch_size, n_segment)
+        batch_lat = _forward_segment_batch(encoder, enc_inp[st:ed], enc_padding_mask[st:ed])
+        seg_latents.append(batch_lat.reshape((ed - st) * encoder.model_max_bars, -1))
+
+    latents = np.concatenate(seg_latents, axis=0)[:n_bar]
+    return latents
+
+
+def prepare_music_data_from_midi(
+    midi_path: str,
+    encoder: MuseTokEncoder,
+    vocab: dict,
+    has_velocity: bool = True,
+    filter_velocity: bool = False,
+):
+    """Load MIDI and build MuseTok segment tensors without running the model."""
+    score = load_midi_symusic(midi_path)
+    bar_positions, events = midi_to_events_symusic(score, has_velocity=has_velocity)
+    events, piece_bar_pos = _filter_events_for_musetok(events, bar_positions, vocab, filter_velocity)
+    music_data = encoder.get_segments(events, piece_bar_pos)
+    return score, music_data
+
+
+def extract_latents_batch_from_midis(
+    midi_paths: List[str],
+    encoder: MuseTokEncoder,
+    vocab: dict,
+    segment_batch_size: int = 32,
+    has_velocity: bool = True,
+    filter_velocity: bool = False,
+) -> List[Tuple[Optional[np.ndarray], Optional[object], Optional[str]]]:
+    """
+    Extract latents for multiple MIDI files with batched GPU forwards.
+
+    Returns list of (latents, score_or_none, error_or_none) per input path.
+    """
+    prepared = []
+    for path in midi_paths:
+        try:
+            score, music_data = prepare_music_data_from_midi(
+                path, encoder, vocab, has_velocity=has_velocity, filter_velocity=filter_velocity
+            )
+            if music_data["n_bar"] == 0:
+                prepared.append((path, None, None, "No bars in MIDI"))
+            else:
+                prepared.append((path, score, music_data, None))
+        except Exception as exc:
+            prepared.append((path, None, None, str(exc)))
+
+    flat_enc = []
+    flat_mask = []
+    song_ranges = []  # (prep_idx, n_bar, start_seg, n_seg)
+    for i, (_path, score, music_data, err) in enumerate(prepared):
+        if err or music_data is None:
+            continue
+        start = len(flat_enc)
+        for seg in range(music_data["n_segment"]):
+            flat_enc.append(music_data["enc_inp"][seg])
+            flat_mask.append(music_data["enc_padding_mask"][seg])
+        song_ranges.append((i, music_data["n_bar"], start, music_data["n_segment"]))
+
+    flat_latents = [None] * len(flat_enc)
+    for chunk_start in range(0, len(flat_enc), segment_batch_size):
+        chunk_end = min(chunk_start + segment_batch_size, len(flat_enc))
+        batch_lat = _forward_segment_batch(
+            encoder,
+            np.stack(flat_enc[chunk_start:chunk_end]),
+            np.stack(flat_mask[chunk_start:chunk_end]),
+        )
+        for j, seg_lat in enumerate(batch_lat):
+            flat_latents[chunk_start + j] = seg_lat.reshape(encoder.model_max_bars, -1)
+
+    results: List[Tuple[Optional[np.ndarray], Optional[object], Optional[str]]] = []
+    for _path, score, music_data, err in prepared:
+        if err:
+            results.append((None, None, err))
+        else:
+            results.append((None, score, None))
+    for prep_idx, n_bar, start_seg, n_seg in song_ranges:
+        parts = [flat_latents[start_seg + j] for j in range(n_seg)]
+        latents = np.concatenate(parts, axis=0)[:n_bar]
+        results[prep_idx] = (latents, prepared[prep_idx][1], None)
+
+    return results
 
 
 def extract_latents_from_midi(midi_path_or_bytes: Union[str, bytes],

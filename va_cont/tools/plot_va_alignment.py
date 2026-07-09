@@ -1,6 +1,11 @@
 """
 2×2 alignment QC plot: audio (seconds) vs MIDI (ticks).
 
+Also writes a per-song folder with:
+  - alignment.png
+  - original_audio.{mp3,wav,...}  (copy of source audio)
+  - midi_synth.wav                (MIDI rendered via symusic)
+
 Usage:
     python va_cont/tools/plot_va_alignment.py --dataset deam --song_id 1000
     python va_cont/tools/plot_va_alignment.py --dataset merp --song_id 1 --show-bars --show
@@ -9,6 +14,7 @@ Usage:
 import argparse
 import logging
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -50,7 +56,7 @@ def collect_piano_roll_notes(score):
     """Return lists of (start_tick, end_tick, pitch) for all notes."""
     starts, ends, pitches = [], [], []
     for track in score.tracks:
-        if track.is_drums:
+        if track.is_drum:
             continue
         for note in track.notes:
             starts.append(int(note.time))
@@ -80,6 +86,23 @@ def plot_va_curves(ax, x, valence, arousal, label_prefix=""):
     ax.set_ylabel("V / A")
 
 
+def export_qc_audio(out_dir: Path, audio_path: Path, score, soundfont: str | None = None, sample_rate: int = 44100):
+    """Copy original audio and write MIDI synthesized to WAV in out_dir."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    original_out = out_dir / f"original_audio{audio_path.suffix}"
+    shutil.copy2(audio_path, original_out)
+    logging.info(f"Copied original audio → {original_out}")
+
+    from symusic import Synthesizer, dump_wav
+
+    synth = Synthesizer(sf_path=soundfont, sample_rate=sample_rate) if soundfont else Synthesizer(sample_rate=sample_rate)
+    buffer = synth.render(score, stereo=True)
+    midi_out = out_dir / "midi_synth.wav"
+    dump_wav(str(midi_out), buffer, sample_rate, use_int16=True)
+    logging.info(f"Wrote MIDI synthesis → {midi_out}")
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Plot audio vs MIDI-tick V/A alignment QC grid.")
     p.add_argument("--dataset", required=True, choices=["deam", "memo2496", "merp"])
@@ -88,6 +111,9 @@ def parse_args():
     p.add_argument("--output_path", default=None)
     p.add_argument("--show-bars", action="store_true", help="Draw bar boundaries on right column")
     p.add_argument("--show", action="store_true")
+    p.add_argument("--skip-audio", action="store_true", help="Skip copying audio / MIDI synthesis")
+    p.add_argument("--soundfont", default=None, help="Optional path to .sf2/.sf3 (default: symusic built-in)")
+    p.add_argument("--synth_sample_rate", type=int, default=44100)
     p.add_argument("--target_hz", type=float, default=DEFAULT_TARGET_HZ)
     return p.parse_args()
 
@@ -175,12 +201,26 @@ def main():
     fig.tight_layout()
 
     if args.output_path is None:
-        out_dir = ds.va_dir() / "qc_plots"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        args.output_path = str(out_dir / f"{song_id}_alignment.png")
+        out_dir = ds.va_dir() / "qc_plots" / str(song_id)
+        args.output_path = str(out_dir / "alignment.png")
+    else:
+        out_dir = Path(args.output_path).parent
 
+    out_dir.mkdir(parents=True, exist_ok=True)
     fig.savefig(args.output_path, dpi=150, bbox_inches="tight")
     logging.info(f"Saved {args.output_path}")
+
+    if not args.skip_audio:
+        try:
+            export_qc_audio(
+                out_dir,
+                audio_path,
+                score,
+                soundfont=args.soundfont,
+                sample_rate=args.synth_sample_rate,
+            )
+        except Exception as exc:
+            logging.warning(f"Audio export failed (plot still saved): {exc}")
 
     if args.show:
         matplotlib.use("TkAgg")

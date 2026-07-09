@@ -12,13 +12,31 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), 'amt/src
 from model_helper import load_model_checkpoint, transcribe
 
 
-def should_process_file(index, gpu_index, num_gpus):
-    """
-    Sharding rule: process file if index % num_gpus == gpu_index.
-    """
+def shard_data(data, gpu_index, num_gpus):
+    """Return (global_index, path) pairs assigned to this worker."""
     if num_gpus <= 1:
-        return True
-    return (index % num_gpus) == gpu_index
+        return list(enumerate(data))
+    return [(idx, path) for idx, path in enumerate(data) if (idx % num_gpus) == gpu_index]
+
+
+def resolve_device(device: str, gpu_index: int, num_gpus: int) -> str:
+    """Map plain 'cuda' to a concrete device when sharding across GPUs.
+
+    gpu_index selects which *files* this worker handles. The CUDA device is:
+    - cuda:0 when CUDA_VISIBLE_DEVICES pins a single GPU (always use logical 0)
+    - cuda:{gpu_index} when all GPUs are visible in one process namespace
+    """
+    if device != "cuda" or num_gpus <= 1:
+        return device
+    if torch.cuda.device_count() == 1:
+        return "cuda:0"
+    if gpu_index >= torch.cuda.device_count():
+        raise ValueError(
+            f"--gpu_index {gpu_index} invalid: only {torch.cuda.device_count()} CUDA device(s) visible. "
+            "Use CUDA_VISIBLE_DEVICES=<id> with --gpu_index <shard> (device will be cuda:0), "
+            "or pass --device cuda:N explicitly."
+        )
+    return f"cuda:{gpu_index}"
 
 
 def main():
@@ -43,6 +61,14 @@ def main():
                         help="Total number of GPUs used for distributed transcription")
 
     args = parser.parse_args()
+
+    if args.num_gpus <= 1 and args.gpu_index != 0:
+        print(
+            f"WARNING: --gpu_index {args.gpu_index} is ignored because --num_gpus={args.num_gpus}. "
+            "Pass --num_gpus 3 (and run one process per GPU) to shard work."
+        )
+
+    args.device = resolve_device(args.device, args.gpu_index, args.num_gpus)
 
     # Load config JSON
     with open(args.config_json, "r") as f:
@@ -85,15 +111,19 @@ def main():
     model = load_model_checkpoint(model_args, device=args.device)
     print("Model loaded.\n")
 
+    shard = shard_data(data, args.gpu_index, args.num_gpus)
+    if not shard:
+        raise ValueError(
+            f"No files assigned to gpu_index={args.gpu_index} with num_gpus={args.num_gpus}."
+        )
+    print(f"Processing {len(shard)} / {len(data)} files on {args.device}.\n")
+
     # ------------------------
     # Process audio files (sharded)
     # ------------------------
-    for idx, audio_path in enumerate(tqdm(data, desc="Total files")):
-
-        # Check whether this GPU should process this file
-        if not should_process_file(idx, args.gpu_index, args.num_gpus):
-            continue
-
+    processed = 0
+    skipped = 0
+    for idx, audio_path in tqdm(shard, desc="Transcribing"):
         audio_path = Path(audio_path)
         if flat_output:
             # VA pipeline: write {song_id}.mid directly into output dir
@@ -106,13 +136,18 @@ def main():
         audio_info = {
             "filepath": str(audio_path),
             "output": str(output_folder),
-            "file_name": audio_path.stem
+            "file_name": audio_path.stem,
+            "flat_output": flat_output,
         }
 
-        midi_path = transcribe(model, audio_info)[0]
-        print(f"[{idx}] Transcribed → {midi_path}")
+        try:
+            transcribe(model, audio_info)
+            processed += 1
+        except Exception as exc:
+            skipped += 1
+            tqdm.write(f"SKIP [{idx}] {audio_path.name}: {exc}")
 
-    print("\nTranscription finished.")
+    print(f"\nTranscription finished ({processed} ok, {skipped} skipped).")
 
 
 if __name__ == "__main__":

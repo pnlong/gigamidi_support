@@ -19,7 +19,7 @@ sys.path.insert(0, str(_REPO_ROOT / "va_cont"))
 from datasets import get_dataset  # noqa: E402
 
 DEFAULT_EXP_ID = (
-    "mc13_256_g4_all_v7_mt3f_sqr_rms_moe_wf4_n8k2_silu_rope_rp_b80_ps2"
+    "mc13_256_g4_all_v7_mt3f_sqr_rms_moe_wf4_n8k2_silu_rope_rp_b80_ps2@model.ckpt"
 )
 
 

@@ -1,110 +1,94 @@
-# DEAM Bar-Level Continuous Valence/Arousal Prediction (`va_cont`)
+# Continuous Valence/Arousal (`va_cont`)
 
-This module trains a bar-level continuous valence/arousal regressor using the DEAM dataset. Unlike the `emotion_genre` approach (which maps categorical emotion labels to fixed VA pairs), this trains directly on DEAM's continuous dynamic annotations aligned to MIDI bars.
+Train a **bar-level continuous valence/arousal regressor** on MIDI, using dynamic V/A annotations from **DEAM**, **Memo2496**, and **MERP**. Unlike the categorical `emotion_genre` approach, this pipeline learns directly from time-varying V/A curves aligned to transcribed MIDI.
 
 ## Overview
 
 **Task:** Predict (valence, arousal) ∈ [-1, 1]² for each bar of a MIDI file.
 
-**Dataset:** [DEAM](https://cvml.unige.ch/databases/DEAM/) — ~1802 songs with dynamic valence/arousal annotations at 500ms intervals, already normalized to [-1, 1]. Annotations start at 15s to exclude the unstable onset region.
+**Training data:** Combined DEAM + Memo2496 + MERP (~5.3k songs after preprocessing).
 
-**Feature extraction:** [MuseTok](https://github.com/Yuer867/MuseTok) — extracts a 128-dimensional latent vector per bar from MIDI. Shared checkpoint from the `emotion_genre` task.
+**Features:** [MuseTok](https://github.com/Yuer867/MuseTok) — 128-dimensional latent per bar from AMT-generated MIDI.
 
-**Model:** 2-layer MLP (`input_dim=128 → hidden_dim=64 → 2`), trained with MSE loss.
+**Model:** Causal transformer (`CausalVATransformer`, config `va_transformer_a.yaml`) or legacy 2-layer MLP.
 
-**Downstream use:** Apply trained model bar-by-bar to GigaMIDI to generate bar-level valence/arousal annotations.
+**Downstream:** Apply the trained model bar-by-bar to GigaMIDI.
 
-## Pipeline Summary
+## Documentation map
 
-See [PIPELINE.md](PIPELINE.md) for full step-by-step instructions.
+| Document | Contents |
+|----------|----------|
+| **[PIPELINE.md](PIPELINE.md)** | Step-by-step commands **and** per-dataset processing methodology (raw → converted MIDI) for paper writing |
+| **[datasets/README.md](datasets/README.md)** | Adapter interface quick reference |
 
-1. **AMT** (external): convert DEAM audio → MIDI
-2. **Preprocess**: extract MuseTok latents + bar start times from MIDI
-3. **Prepare labels**: align DEAM 500ms annotations to MIDI bars
-4. **Train**: fit `ValenceArousalRegressor` on bar-level latents
-5. **Annotate GigaMIDI**: apply trained model bar-by-bar
+## Pipeline summary
 
-## File Structure
+See [PIPELINE.md](PIPELINE.md) for commands and the full methodology section.
+
+1. **Download** raw DEAM / Memo2496 / MERP under `$XMIDI_STORAGE_DIR`
+2. **AMT** (YourMT3+ multitrack): audio → MIDI
+3. **MuseTok**: MIDI → bar latents (`.safetensors`)
+4. **convert_va**: audio-time V/A → tick-indexed continuous storage (`.npz`)
+5. **QC**: alignment plots (audio seconds vs MIDI ticks)
+6. **Train**: combined `va_transformer_a` on all three sources
+7. **Annotate GigaMIDI**: bar-level V/A predictions
+
+## File structure
 
 ```
 va_cont/
 ├── README.md
-├── PIPELINE.md
+├── PIPELINE.md                 # ← methodology for paper reproducibility
 ├── requirements.txt
-├── annotate_gigamidi.py          # Apply trained model to GigaMIDI (bar-by-bar)
+├── va_utils.py                 # resample, tick alignment, bar aggregation
+├── annotate_gigamidi.py
+├── datasets/                   # DEAM, Memo2496, MERP adapters
 ├── preprocess/
-│   └── preprocess_deam_musetok.py  # Extract MuseTok latents + bar times from DEAM MIDI
+│   ├── preprocess_musetok.py   # generic --dataset {deam,memo2496,merp}
+│   └── convert_va.py
 ├── pretrain_model/
-│   ├── prepare_labels.py         # Align DEAM annotations to bars → JSON labels + splits
-│   ├── dataset.py                # DEAMDataset (bar-level continuous VA)
-│   ├── model.py                  # ValenceArousalRegressor (2-layer MLP)
-│   ├── train.py                  # Training script (MSE loss, WandB, early stopping)
-│   └── configs/
-│       ├── deam_bars1.yml        # 1 bar per sample
-│       └── deam_bars4.yml        # 4-bar mean-pooled chunks
-└── utils/                        # Symlink → ../emotion_genre/utils/
-    ├── data_utils.py
-    ├── midi_utils.py
-    ├── musetok_utils.py
-    └── config_utils.py
+│   ├── train.py
+│   ├── dataset.py
+│   ├── model.py
+│   └── configs/va_transformer_a.yaml
+└── tools/
+    ├── verify_datasets.py
+    └── plot_va_alignment.py
 ```
 
-## Storage Directory Structure
+## Storage layout (derived artifacts)
+
+All derived data lives beside the raw datasets under `$XMIDI_STORAGE_DIR` (default `/deepfreeze/pnlong/gigamidi`):
 
 ```
-$XMIDI_STORAGE_DIR/  (default: /deepfreeze/pnlong/gigamidi)
-├── deam/
-│   ├── DEAM_audio/MEMD_audio/     # Source MP3 files
-│   ├── DEAM_midi/MEMD_midi/       # AMT-generated MIDI (same numeric IDs)
-│   └── DEAM_Annotations/          # Annotation CSVs
-└── deam_va/
-    ├── latents_musetok/           # Preprocessed latents: {song_id}.safetensors
-    ├── labels/
-    │   ├── deam_va_labels.json    # {song_id: [[bar_idx, valence, arousal], ...]}
-    │   ├── train_songs.txt
-    │   ├── val_songs.txt
-    │   └── test_songs.txt
-    └── checkpoints/trained_models/
-        └── deam_va_regressor_bars1/
-            ├── checkpoints/
-            │   ├── best_model.pt
-            │   └── best_optimizer.pt
-            ├── statistics.csv
-            └── train.log
+{dataset}_va/
+├── latents_musetok/{song_id}.safetensors   # MuseTok bar latents + metadata
+├── continuous/{song_id}.npz                # tick-indexed V/A (canonical labels)
+└── labels/
+    ├── train_songs.txt, val_songs.txt, test_songs.txt
+    └── {dataset}_va_labels.json            # optional bar cache from --cache-bar-labels
 ```
 
-## Annotation Format
+MIDI from AMT is stored per dataset (`deam/DEAM_midi/`, `memo2496_midi/`, `merp_midi/`). See [PIPELINE.md](PIPELINE.md) for exact paths.
 
-**`deam_va_labels.json`**:
-```json
-{
-  "1000": [[5, -0.12, 0.34], [6, -0.09, 0.31], ...],
-  "1001": [[8, 0.45, 0.12], ...]
-}
-```
-Each entry: `[bar_idx, valence, arousal]`. Bars before 15s are excluded (no annotation coverage).
+## Key design notes
 
-**`bar_va_annotations.csv`** (GigaMIDI output):
-```
-md5,bar_idx,valence,arousal
-abc123,0,0.412,-0.088
-abc123,1,0.398,-0.091
-...
-```
-
-## Key Design Notes
-
-- **Temporal alignment**: Bar `i` spans `[bar_start_times[i], bar_start_times[i+1])`. Annotation samples (500ms intervals) falling within the window are averaged. Bar start times in seconds are computed from MIDI tick positions + tempo track.
-- **15s cutoff**: Bars with no annotation samples (before 15s) are excluded from training. No fallback to song-level mean.
-- **Dynamic annotations**: Already in [-1, 1]; no normalization required.
-- **Song-level balanced sampler** (`--balanced_sampler`): Weights bar samples by `1/n_annotated_bars_in_song` so songs contribute equally regardless of length.
-- **GigaMIDI inference**: Each bar's 128d latent is fed to the model independently.
+- **Canonical label format:** tick-indexed continuous `.npz` (`ticks`, `valence`, `arousal`, `tpq`, `bar_resol`). Bar targets are derived at train time (or from optional JSON cache).
+- **Unified resampling:** all sources are linearly interpolated to **10 Hz** before MIDI tick mapping, regardless of native rate (DEAM 2 Hz, Memo2496 1 Hz, MERP 10 Hz).
+- **Temporal alignment:** audio-second timestamps are mapped to MIDI ticks via the AMT score's tempo track (`seconds_to_ticks` in `va_utils.py`).
+- **MERP:** use `annotations_raw.parquet` (full-song), not `annotations_filtered.parquet` (segment-trimmed for the MERP paper). Details in [PIPELINE.md](PIPELINE.md).
+- **Overlap policy:** MERP tracks that overlap DEAM anchor songs are excluded from MERP train/val/test splits.
 
 ## Dependencies
 
-See `requirements.txt`. Core packages: `torch`, `symusic`, `safetensors`, `pandas`, `numpy`, `wandb`, `tqdm`, `PyYAML`.
+See `requirements.txt`. MuseTok checkpoint (shared with `emotion_genre`):
 
-MuseTok checkpoint (shared with `emotion_genre`):
 ```
-/deepfreeze/pnlong/gigamidi/musetok/best_tokenizer.pt
+$XMIDI_STORAGE_DIR/musetok/best_tokenizer.pt
+```
+
+YourMT3+ multitrack checkpoint (AMT):
+
+```
+mc13_256_g4_all_v7_mt3f_sqr_rms_moe_wf4_n8k2_silu_rope_rp_b80_ps2@model.ckpt
 ```

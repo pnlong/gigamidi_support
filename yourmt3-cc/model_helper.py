@@ -15,10 +15,75 @@ from config.vocabulary import drum_vocab_presets
 from utils.utils import str2bool
 from utils.utils import Timer
 from utils.audio import slice_padded_array
-from utils.note2event import mix_notes
+from utils.note2event import mix_notes, note2note_event
 from utils.event2note import merge_zipped_note_events_and_ties_to_notes
+from utils.midi import note_event2midi
 from utils.utils import write_model_output_as_midi, write_err_cnt_as_json
 from model.ymt3 import YourMT3
+from utils.note_event_dataclasses import Note
+
+
+def load_audio_file(filepath):
+    """Load audio as float32 tensor [channels, time] + sample rate.
+
+    Tries soundfile first; falls back to librosa for MP3 edge cases that
+    trigger libmpg123 errors via sndfile.
+    """
+    import soundfile as sf
+
+    try:
+        data, sr = sf.read(filepath, always_2d=True)
+        audio = torch.from_numpy(data.T.astype("float32"))
+        return audio, sr
+    except Exception:
+        import librosa
+
+        data, sr = librosa.load(filepath, sr=None, mono=False)
+        if data.ndim == 1:
+            data = data[None, :]
+        audio = torch.from_numpy(data.astype("float32"))
+        return audio, int(sr)
+
+
+def _apply_output_vocab(notes, output_inverse_vocab):
+    if output_inverse_vocab is None:
+        return notes
+    mapped = []
+    for note in notes:
+        if note.is_drum:
+            mapped.append(note)
+        else:
+            mapped.append(
+                Note(
+                    is_drum=note.is_drum,
+                    program=output_inverse_vocab.get(note.program, [note.program])[0],
+                    onset=note.onset,
+                    offset=note.offset,
+                    pitch=note.pitch,
+                    velocity=note.velocity,
+                )
+            )
+    return mapped
+
+
+def _write_transcription_midi(pred_notes, audio_info, output_inverse_vocab):
+    flat_output = bool(audio_info.get("flat_output"))
+    if flat_output:
+        os.makedirs(audio_info["output"], exist_ok=True)
+        midifile = os.path.join(audio_info["output"], audio_info["file_name"] + ".mid")
+        notes = _apply_output_vocab(pred_notes, output_inverse_vocab)
+        note_events = note2note_event(notes, return_activity=False)
+        note_event2midi(note_events, midifile, output_inverse_vocab=output_inverse_vocab)
+        return midifile
+
+    write_model_output_as_midi(
+        pred_notes,
+        audio_info["output"],
+        audio_info["file_name"],
+        output_inverse_vocab=output_inverse_vocab,
+    )
+    return os.path.join(audio_info["output"], "model_output", audio_info["file_name"] + ".mid")
+
 
 def load_model_checkpoint(args=None, device='cpu'):
     parser = argparse.ArgumentParser(description="YourMT3")
@@ -122,7 +187,7 @@ def load_model_checkpoint(args=None, device='cpu'):
 
 
 def transcribe(model, audio_info, program=None, is_drum=False, write=True):
-    audio, sr = torchaudio.load(uri=audio_info['filepath'])
+    audio, sr = load_audio_file(audio_info['filepath'])
     audio = torch.mean(audio, dim=0).unsqueeze(0)
     audio = torchaudio.functional.resample(audio, sr, model.audio_cfg['sample_rate'])
     audio_segments = slice_padded_array(audio, model.audio_cfg['input_frames'], model.audio_cfg['input_frames'])
@@ -160,13 +225,11 @@ def transcribe(model, audio_info, program=None, is_drum=False, write=True):
     # Write MIDI
     midifile = None
     if write:
-        write_model_output_as_midi(pred_notes, 
-                                audio_info['output'],
-                                audio_info['file_name'], 
-                                output_inverse_vocab=model.midi_output_inverse_vocab,
-                                tempo=int(audio_info.get("tempo", 120)))
-        #t.print_elapsed_time("post processing")
-        midifile =  os.path.join(audio_info['output'], audio_info['file_name']  + '.mid')
+        midifile = _write_transcription_midi(
+            pred_notes,
+            audio_info,
+            model.midi_output_inverse_vocab,
+        )
         assert os.path.exists(midifile)
     return midifile, pred_notes
 
@@ -180,7 +243,7 @@ def transcribe_single_inst(model, audio_info, program=None, is_drum=False):
     # -------------------------
     # 1. Load + preprocess audio
     # -------------------------
-    audio, sr = torchaudio.load(uri=audio_info['filepath'])
+    audio, sr = load_audio_file(audio_info['filepath'])
     audio = torch.mean(audio, dim=0).unsqueeze(0)
     audio = torchaudio.functional.resample(audio, sr, model.audio_cfg['sample_rate'])
 
