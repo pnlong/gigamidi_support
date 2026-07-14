@@ -4,6 +4,19 @@ import numpy as np
 import pytest
 
 from va_utils import aggregate_va_to_bars, resample_va_dict
+from pretrain_model.midi_features import handcrafted_features_from_bar_events, HANDCRAFTED_FEATURE_DIM
+
+
+def test_handcrafted_features_from_events():
+    events = [
+        {"name": "Note_Pitch", "value": 60},
+        {"name": "Note_Pitch", "value": 64},
+        {"name": "Note_Velocity", "value": 80},
+        {"name": "Note_Duration", "value": 480},
+    ]
+    feats = handcrafted_features_from_bar_events(events)
+    assert feats.shape == (HANDCRAFTED_FEATURE_DIM,)
+    assert feats[0] > 0  # note count
 
 
 def test_resample_va_dict():

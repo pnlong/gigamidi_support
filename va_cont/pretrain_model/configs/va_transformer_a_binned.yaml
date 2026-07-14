@@ -1,0 +1,34 @@
+# Model A with soft-binned VA targets (n=20 equal bins on [-1, 1]).
+# Loss: KL divergence on Gaussian soft labels; metrics use expected bin centers.
+datasets: [deam, memo2496, merp]
+storage_dir: /deepfreeze/pnlong/gigamidi
+latents_dir:  /deepfreeze/pnlong/gigamidi/deam_va/latents_musetok
+labels_path:  /deepfreeze/pnlong/gigamidi/deam_va/labels/deam_va_labels.json
+train_songs:  /deepfreeze/pnlong/gigamidi/deam_va/labels/train_songs.txt
+valid_songs:  /deepfreeze/pnlong/gigamidi/deam_va/labels/val_songs.txt
+va_conditioning: false
+latent_dim:  128
+d_model:     128
+n_heads:     4
+n_layers:    2
+d_ff:        256
+dropout:     0.1
+max_len:     512
+batch_size:               32
+learning_rate:            1e-4
+weight_decay:             1e-5
+epochs:                   10000
+valid_every_epochs:       1
+early_stopping:           false
+gpu:         true
+num_workers: 4
+target_mode:          binned
+n_bins:               20
+# bin_sigma: omitted → defaults to one bin width (0.1 for n=20)
+differential_weight:  0.0
+va_jitter_std:        0.05
+va_label_dropout:     0.1
+checkpoint_metric:    corr_sum
+output_dir:    /deepfreeze/pnlong/gigamidi/deam_va/checkpoints/trained_models
+model_name:    va_transformer_a_binned
+wandb_project: gigamidi-support

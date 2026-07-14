@@ -7,10 +7,16 @@ Two model variants (ablation):
   Model B (--va_conditioning true):  additionally conditions on the previous
       bar's V/A prediction (teacher-forced during training).
 
+Target modes (--target_mode):
+  absolute     — MSE on continuous V/A (default)
+  differential — MSE on bar-to-bar deltas
+  binned       — soft-bin KL loss on [-1,1]; decode via expected bin centers
+
 WandB metrics:
   valid/mse, valid/mae: Lower is better (teacher-forced for Model B).
   Model B also logs valid/ar_mse, valid/ar_mae (autoregressive inference).
   valid/corr_valence, valid/corr_arousal: Pearson r; Model B uses AR only (not logged for train).
+  Per-dataset corr: Model A from single-pass forward; Model B from AR (valid/ar/{dataset}/corr_*).
   Best checkpoint: valid/ar_mse for Model B, valid/mse for Model A.
 """
 
@@ -21,6 +27,7 @@ import sys
 import os
 from os.path import dirname, realpath
 from multiprocessing import cpu_count
+from typing import Optional
 
 import wandb
 from datetime import datetime
@@ -42,7 +49,17 @@ from pretrain_model.dataset import (
     CombinedVASequenceDataset,
     build_dataset_for_source,
 )
-from pretrain_model.model import CausalVATransformer
+from pretrain_model.model import CausalVATransformer, VAModel
+from pretrain_model.va_bins import (
+    binned_va_kl_loss,
+    default_bin_sigma,
+    va_to_soft_bin_targets,
+)
+from pretrain_model.midi_features import (
+    HANDCRAFTED_FEATURE_DIM,
+    load_remi_vocab,
+    remi_vocab_size,
+)
 from utils.data_utils import ensure_dir, infer_input_dim
 from utils.config_utils import load_config, apply_config
 
@@ -138,6 +155,15 @@ def augment_va_training(
     return va_aug, mask_aug
 
 
+def _model_forward_kwargs(batch: dict, device: torch.device) -> dict:
+    """Build optional REMI kwargs for VAModel.forward."""
+    kwargs = {}
+    if "bar_tokens" in batch:
+        kwargs["bar_tokens"] = batch["bar_tokens"].to(device=device, dtype=torch.long)
+        kwargs["token_padding_mask"] = batch["token_padding_mask"].to(device=device, dtype=torch.bool)
+    return kwargs
+
+
 def evaluate_batch(
     model: nn.Module,
     batch: dict,
@@ -150,6 +176,9 @@ def evaluate_batch(
     differential_weight: float = 0.0,
     va_jitter_std: float = 0.0,
     va_label_dropout: float = 0.0,
+    max_grad_norm: float = 0.0,
+    n_bins: int = 20,
+    bin_sigma: float = None,
 ):
     """
     Forward pass, optional backward pass, and metrics.
@@ -160,13 +189,16 @@ def evaluate_batch(
     Args:
         target_mode:          "absolute" — MSE on absolute VA values (default);
                               "differential" — MSE on bar-to-bar deltas between
-                                              consecutive labeled positions.
+                                              consecutive labeled positions;
+                              "binned" — soft-bin KL loss; metrics use expected VA.
         differential_weight:  Only used when target_mode="absolute". When > 0, adds a
                               differential MSE term:
                               loss = (1 - w)*MSE_abs + w*MSE_diff.
         va_jitter_std:        Gaussian noise std on labeled V/A during training (0=off).
         va_label_dropout:     Probability of dropping each labeled bar from the loss
                               during training (0=off).
+        n_bins:               Number of equal bins on [-1, 1] for target_mode=binned.
+        bin_sigma:            Gaussian soft-label width in VA units (default: one bin).
     """
     latents      = batch["latents"].to(device)       # (B, T, 128)
     va_targets   = batch["va_targets"].to(device)    # (B, T, 2)
@@ -181,18 +213,49 @@ def evaluate_batch(
     if update_parameters:
         optimizer.zero_grad()
 
-    pred = model(
+    fwd_kw = _model_forward_kwargs(batch, device)
+    raw = model(
         latents,
         padding_mask=padding_mask,
         va_targets=va_targets,
         label_mask=label_mask,
-    )  # (B, T, 2)
+        **fwd_kw,
+    )
+    binned = target_mode == "binned"
+    pred = model.decode_va(raw) if binned else raw
 
     # Restrict to annotated bars only
+    n_labeled = int(label_mask.sum().item())
+    if n_labeled == 0:
+        zero_metrics = {"mse": 0.0, "mae": 0.0, "corr_valence": 0.0, "corr_arousal": 0.0,
+                        "n_labeled": 0}
+        if return_predictions:
+            empty = np.zeros((0, 2), dtype=np.float32)
+            return 0.0, zero_metrics, (empty, empty)
+        return 0.0, zero_metrics
+
     pred_labeled   = pred[label_mask]        # (N, 2)
     target_labeled = va_targets[label_mask]  # (N, 2)
+    raw_labeled    = raw[label_mask] if binned else None
 
-    if target_mode == "differential":
+    if not torch.isfinite(pred_labeled).all():
+        logging.warning("Non-finite predictions detected in batch; skipping gradient update.")
+        if update_parameters:
+            optimizer.zero_grad(set_to_none=True)
+        nan_metrics = {"mse": float("nan"), "mae": float("nan"),
+                       "corr_valence": 0.0, "corr_arousal": 0.0, "n_labeled": n_labeled}
+        if return_predictions:
+            p = np.nan_to_num(pred_labeled.detach().cpu().numpy(), nan=0.0)
+            t = target_labeled.detach().cpu().numpy()
+            return float("nan"), nan_metrics, (p, t)
+        return float("nan"), nan_metrics
+
+    if target_mode == "binned":
+        sigma = bin_sigma if bin_sigma is not None else default_bin_sigma(n_bins)
+        centers = model.transformer.bin_centers
+        soft_v, soft_a = va_to_soft_bin_targets(target_labeled, centers, sigma)
+        loss = binned_va_kl_loss(raw_labeled, soft_v, soft_a, n_bins)
+    elif target_mode == "differential":
         loss = _compute_differential_loss(pred, va_targets, label_mask, loss_fn)
     elif differential_weight > 0.0:
         loss_abs  = loss_fn(pred_labeled, target_labeled)
@@ -202,8 +265,14 @@ def evaluate_batch(
         loss = loss_fn(pred_labeled, target_labeled)
 
     if update_parameters:
-        loss.backward()
-        optimizer.step()
+        if not torch.isfinite(loss):
+            logging.warning(f"Non-finite loss ({float(loss.detach())}); skipping optimizer step.")
+            optimizer.zero_grad(set_to_none=True)
+        else:
+            loss.backward()
+            if max_grad_norm and max_grad_norm > 0.0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            optimizer.step()
 
     loss_value = float(loss.detach())
     with torch.no_grad():
@@ -233,19 +302,65 @@ def _pearson_corr(pred: np.ndarray, target: np.ndarray) -> tuple[float, float]:
     return (0.0 if np.isnan(rv) else rv, 0.0 if np.isnan(ra) else ra)
 
 
+def _checkpoint_value(
+    valid_metrics: dict,
+    ar_metrics: Optional[dict],
+    va_conditioning: bool,
+    checkpoint_metric: str,
+) -> tuple[float, bool]:
+    """
+    Return (value, lower_is_better) for best-checkpoint comparison.
+    """
+    use_ar = va_conditioning and ar_metrics
+    m = ar_metrics if use_ar else valid_metrics
+    if checkpoint_metric == "mse":
+        return float(m["mse"]), True
+    if checkpoint_metric == "corr_valence":
+        return float(m["corr_valence"]), False
+    return float(m["corr_valence"] + m["corr_arousal"]), False
+
+
+def _per_dataset_corr(
+    preds: list[np.ndarray],
+    targets: list[np.ndarray],
+    sources: list[str],
+) -> dict[str, dict[str, float]]:
+    """Pooled Pearson r per dataset source."""
+    by_src: dict[str, tuple[list, list]] = {}
+    for p, t, src in zip(preds, targets, sources):
+        by_src.setdefault(src, ([], []))
+        by_src[src][0].append(p)
+        by_src[src][1].append(t)
+    out = {}
+    for src, (pl, tl) in by_src.items():
+        if not pl:
+            continue
+        p_all = np.concatenate(pl, axis=0)
+        t_all = np.concatenate(tl, axis=0)
+        rv, ra = _pearson_corr(p_all, t_all)
+        out[src] = {"corr_valence": rv, "corr_arousal": ra, "n_bars": int(p_all.shape[0])}
+    return out
+
+
 def evaluate_autoregressive(
-    model: CausalVATransformer,
+    model: VAModel,
     loader: torch.utils.data.DataLoader,
     device: torch.device,
+    return_per_song: bool = False,
 ) -> dict:
     """
     Autoregressive validation for Model B (no teacher forcing).
 
     Returns dict with mse, mae, corr_valence, corr_arousal over all labeled bars.
+    If return_per_song=True, also includes per_song_preds/targets/sources lists
+    for per-dataset breakdown (same inference mode as the pooled corr metrics).
     """
     model.eval()
     all_preds: list[np.ndarray] = []
     all_targets: list[np.ndarray] = []
+    per_song_preds: list[np.ndarray] = []
+    per_song_targets: list[np.ndarray] = []
+    per_song_sources: list[str] = []
 
     with torch.no_grad():
         for batch in loader:
@@ -253,31 +368,53 @@ def evaluate_autoregressive(
             targets = batch["va_targets"].to(device)
             mask = batch["label_mask"].to(device)
             padding_mask = batch["padding_mask"].to(device)
+            sources = batch.get("dataset_source", ["unknown"] * latents.shape[0])
             for b in range(latents.shape[0]):
                 seq_len = int((~padding_mask[b]).sum().item())
                 if seq_len == 0:
                     continue
-                pred = model.infer_sequential(latents[b : b + 1, :seq_len])
+                if "bar_tokens" in batch:
+                    bt = batch["bar_tokens"][b : b + 1, :seq_len].to(device)
+                    tm = batch["token_padding_mask"][b : b + 1, :seq_len].to(device)
+                    pred = model.infer_sequential(bar_tokens=bt, token_padding_mask=tm)
+                else:
+                    pred = model.infer_sequential(latents[b : b + 1, :seq_len])
                 bar_mask = mask[b, :seq_len]
                 if not bar_mask.any():
                     continue
-                all_preds.append(pred[bar_mask].cpu().numpy())
-                all_targets.append(targets[b, :seq_len][bar_mask].cpu().numpy())
+                p = pred[bar_mask].cpu().numpy()
+                t = targets[b, :seq_len][bar_mask].cpu().numpy()
+                all_preds.append(p)
+                all_targets.append(t)
+                if return_per_song:
+                    per_song_preds.append(p)
+                    per_song_targets.append(t)
+                    per_song_sources.append(sources[b] if b < len(sources) else "unknown")
 
     if not all_preds:
-        return {"mse": 0.0, "mae": 0.0, "corr_valence": 0.0, "corr_arousal": 0.0}
+        out = {"mse": 0.0, "mae": 0.0, "corr_valence": 0.0, "corr_arousal": 0.0}
+        if return_per_song:
+            out["per_song_preds"] = []
+            out["per_song_targets"] = []
+            out["per_song_sources"] = []
+        return out
 
     p_all = np.concatenate(all_preds, axis=0)
     t_all = np.concatenate(all_targets, axis=0)
     mse = float(((p_all - t_all) ** 2).mean())
     mae = float(np.abs(p_all - t_all).mean())
     corr_v, corr_a = _pearson_corr(p_all, t_all)
-    return {
+    out = {
         "mse": mse,
         "mae": mae,
         "corr_valence": corr_v,
         "corr_arousal": corr_a,
     }
+    if return_per_song:
+        out["per_song_preds"] = per_song_preds
+        out["per_song_targets"] = per_song_targets
+        out["per_song_sources"] = per_song_sources
+    return out
 
 
 def parse_args():
@@ -340,10 +477,15 @@ def parse_args():
                         default=max(1, int(cpu_count() / 4)))
     # Loss objective
     parser.add_argument("--target_mode", type=str, default="absolute",
-                        choices=["absolute", "differential"],
+                        choices=["absolute", "differential", "binned"],
                         help="'absolute': MSE on absolute VA values (default). "
                              "'differential': MSE on bar-to-bar deltas between "
-                             "consecutive labeled positions.")
+                             "consecutive labeled positions. "
+                             "'binned': soft-bin KL loss on [-1,1].")
+    parser.add_argument("--n_bins", type=int, default=20,
+                        help="Equal bins on [-1,1] when target_mode=binned.")
+    parser.add_argument("--bin_sigma", type=float, default=None,
+                        help="Soft-label Gaussian width in VA units (default: one bin width).")
     parser.add_argument("--differential_weight", type=float, default=0.0,
                         help="Only used when target_mode=absolute. Weight w in "
                              "loss = (1-w)*MSE_abs + w*MSE_diff. Default 0 (pure absolute).")
@@ -353,6 +495,20 @@ def parse_args():
     parser.add_argument("--va_label_dropout", type=float, default=0.1,
                         help="Per-bar probability of dropping a labeled bar from the "
                              "training loss. 0 disables.")
+    # Input representation
+    parser.add_argument("--feature_mode", type=str, default="musetok",
+                        choices=["musetok", "handcrafted", "remi"],
+                        help="Bar input: musetok latents, handcrafted MIDI stats, or REMI tokens.")
+    parser.add_argument("--remi_vocab_size", type=int, default=None,
+                        help="REMI vocab size (inferred from MuseTok dict if omitted).")
+    parser.add_argument("--remi_max_tokens", type=int, default=128)
+    parser.add_argument("--remi_encoder_layers", type=int, default=2)
+    parser.add_argument("--remi_encoder_d_model", type=int, default=128)
+    parser.add_argument("--checkpoint_metric", type=str, default="mse",
+                        choices=["mse", "corr_sum", "corr_valence"],
+                        help="Metric for best checkpoint selection (lower is better for mse).")
+    parser.add_argument("--max_grad_norm", type=float, default=1.0,
+                        help="Clip gradient norm (0 disables). Recommended for feature_mode=remi.")
     # Checkpointing / logging
     parser.add_argument("--output_dir",    type=str, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--model_name",    type=str, default="va_transformer_a")
@@ -367,19 +523,32 @@ def parse_args():
 
     if args.latent_dim is None:
         try:
-            if args.datasets:
+            if args.feature_mode == "handcrafted":
+                args.latent_dim = HANDCRAFTED_FEATURE_DIM
+            elif args.datasets:
                 from datasets import get_dataset
+                from pretrain_model.dataset import _features_dir_for_adapter
                 for name in args.datasets:
                     ds = get_dataset(name, args.storage_dir)
-                    if ds.latents_dir().is_dir():
-                        args.latent_dim = infer_input_dim(str(ds.latents_dir()))
+                    feat_dir = _features_dir_for_adapter(ds, args.feature_mode)
+                    if feat_dir.is_dir():
+                        if args.feature_mode == "remi":
+                            args.latent_dim = 128
+                        else:
+                            args.latent_dim = infer_input_dim(str(feat_dir))
                         break
-            if args.latent_dim is None:
+            if args.latent_dim is None and args.feature_mode == "musetok":
                 args.latent_dim = infer_input_dim(args.latents_dir)
         except FileNotFoundError:
             pass
         if args.latent_dim is None:
             args.latent_dim = 128
+
+    if args.feature_mode == "remi" and args.remi_vocab_size is None:
+        try:
+            args.remi_vocab_size = remi_vocab_size(load_remi_vocab())
+        except FileNotFoundError:
+            args.remi_vocab_size = 0
 
     args.checkpoint_dir = os.path.join(args.output_dir, args.model_name, "checkpoints")
     ensure_dir(args.checkpoint_dir)
@@ -391,11 +560,11 @@ def load_song_list(path: str):
         return [line.strip() for line in f if line.strip()]
 
 
-def _build_combined_datasets(dataset_names, split, storage_dir=None):
+def _build_combined_datasets(dataset_names, split, storage_dir=None, feature_mode="musetok"):
     """Build CombinedVASequenceDataset from named sources; skip missing."""
     parts = []
     for name in dataset_names:
-        ds_part = build_dataset_for_source(name, split, storage_dir)
+        ds_part = build_dataset_for_source(name, split, storage_dir, feature_mode=feature_mode)
         if ds_part is not None and len(ds_part) > 0:
             parts.append(ds_part)
             logging.info(f"{name} — {split}: {len(ds_part)} songs")
@@ -467,12 +636,17 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     logging.info(f"Using device: {device}")
     logging.info(f"Model variant: {'B (va_conditioning)' if args.va_conditioning else 'A (latents only)'}")
+    logging.info(f"Feature mode: {args.feature_mode}")
 
     dataset_names = args.datasets
     if dataset_names:
         logging.info(f"Combined training datasets: {dataset_names}")
-        train_dataset = _build_combined_datasets(dataset_names, "train", args.storage_dir)
-        valid_dataset = _build_combined_datasets(dataset_names, "valid", args.storage_dir)
+        train_dataset = _build_combined_datasets(
+            dataset_names, "train", args.storage_dir, args.feature_mode,
+        )
+        valid_dataset = _build_combined_datasets(
+            dataset_names, "valid", args.storage_dir, args.feature_mode,
+        )
         if train_dataset is None or valid_dataset is None:
             logging.error("No training data available for requested datasets.")
             sys.exit(1)
@@ -508,7 +682,14 @@ if __name__ == "__main__":
         logging.info(f"Step mode: {args.steps} total steps, {steps_per_epoch} steps/epoch "
                      f"(≈{args.steps / steps_per_epoch:.1f} epochs)")
 
-    model = CausalVATransformer(
+    if args.target_mode == "binned" and args.differential_weight > 0.0:
+        logging.warning("differential_weight ignored when target_mode=binned")
+
+    output_mode = "binned" if args.target_mode == "binned" else "regression"
+    bin_sigma = args.bin_sigma if args.bin_sigma is not None else default_bin_sigma(args.n_bins)
+
+    model = VAModel(
+        feature_mode=args.feature_mode,
         latent_dim=args.latent_dim,
         d_model=args.d_model,
         n_heads=args.n_heads,
@@ -517,10 +698,21 @@ if __name__ == "__main__":
         dropout=args.dropout,
         max_len=args.max_len,
         va_conditioning=args.va_conditioning,
+        remi_vocab_size=args.remi_vocab_size or 0,
+        remi_max_tokens=args.remi_max_tokens,
+        remi_encoder_layers=args.remi_encoder_layers,
+        remi_encoder_d_model=args.remi_encoder_d_model,
+        output_mode=output_mode,
+        n_bins=args.n_bins,
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     logging.info(f"Model parameters: {n_params:,}")
     logging.info(f"Transformer dropout: {args.dropout}")
+    if args.target_mode == "binned":
+        logging.info(
+            f"Binned targets: n_bins={args.n_bins}, bin_sigma={bin_sigma:.4f} "
+            f"(bin width={2.0 / args.n_bins:.4f})"
+        )
     if args.va_jitter_std > 0.0 or args.va_label_dropout > 0.0:
         logging.info(
             f"VA label regularization (train only): "
@@ -562,7 +754,8 @@ if __name__ == "__main__":
         pd.DataFrame(columns=stats_columns).to_csv(stats_file, index=False)
 
     state = {
-        "best_valid_mse": float("inf"),
+        "best_checkpoint_value": float("inf"),
+        "best_checkpoint_lower": True,
         "best_metrics": {},
         "early_stopping_counter": 0,
         "done": False,
@@ -583,25 +776,59 @@ if __name__ == "__main__":
         valid_metrics = {k: 0.0 for k in train_metrics}
         valid_count = 0
         all_preds, all_targets = [], []
+        per_song_preds, per_song_targets, per_song_sources = [], [], []
 
         with torch.no_grad():
             for batch_v in valid_loader:
-                loss_v, metrics_v, (pv, tv) = evaluate_batch(
+                loss_v, metrics_v, _ = evaluate_batch(
                     model, batch_v, loss_fn, device, return_predictions=True,
                     target_mode=args.target_mode,
                     differential_weight=args.differential_weight,
+                    n_bins=args.n_bins,
+                    bin_sigma=bin_sigma,
                 )
-                n = pv.shape[0]
-                valid_loss += loss_v * n
-                for k in valid_metrics:
-                    valid_metrics[k] += metrics_v[k] * n
-                valid_count += n
-                all_preds.append(pv)
-                all_targets.append(tv)
+                # Per-song preds for per-dataset breakdown (Model A only; Model B uses AR)
+                if not args.va_conditioning:
+                    latents_v = batch_v["latents"].to(device)
+                    va_t = batch_v["va_targets"].to(device)
+                    mask_v = batch_v["label_mask"].to(device)
+                    padding_v = batch_v["padding_mask"].to(device)
+                    fwd_kw = _model_forward_kwargs(batch_v, device)
+                    raw_v = model(
+                        latents_v, padding_mask=padding_v,
+                        va_targets=va_t, label_mask=mask_v, **fwd_kw,
+                    )
+                    pred_v = model.decode_va(raw_v)
+                    sources = batch_v.get("dataset_source", ["unknown"] * pred_v.shape[0])
+                    for b in range(pred_v.shape[0]):
+                        m = mask_v[b]
+                        if not m.any():
+                            continue
+                        p_b = pred_v[b, m].cpu().numpy()
+                        if not np.isfinite(p_b).all():
+                            continue
+                        per_song_preds.append(p_b)
+                        per_song_targets.append(va_t[b, m].cpu().numpy())
+                        per_song_sources.append(sources[b] if b < len(sources) else "unknown")
+                    p_flat = pred_v[mask_v].cpu().numpy()
+                    if np.isfinite(p_flat).all():
+                        all_preds.append(p_flat)
+                        all_targets.append(va_t[mask_v].cpu().numpy())
+                else:
+                    mask_v = batch_v["label_mask"].to(device)
+
+                n = metrics_v.get("n_labeled", int(mask_v.sum().item()))
+                if n > 0 and np.isfinite(loss_v):
+                    valid_loss += loss_v * n
+                    for k in valid_metrics:
+                        valid_metrics[k] += metrics_v[k] * n
+                    valid_count += n
 
         ar_metrics = None
         if args.va_conditioning:
-            ar_metrics = evaluate_autoregressive(model, valid_loader, device)
+            ar_metrics = evaluate_autoregressive(
+                model, valid_loader, device, return_per_song=True,
+            )
 
         if valid_count:
             valid_loss /= valid_count
@@ -610,12 +837,28 @@ if __name__ == "__main__":
             if not args.va_conditioning:
                 p_all = np.concatenate(all_preds, axis=0)
                 t_all = np.concatenate(all_targets, axis=0)
-                if p_all.shape[0] > 1:
+                if p_all.shape[0] > 1 and np.isfinite(p_all).all():
                     rv, ra = _pearson_corr(p_all, t_all)
                     valid_metrics["corr_valence"] = rv
                     valid_metrics["corr_arousal"] = ra
 
         epoch = global_step / steps_per_epoch
+        if args.va_conditioning and ar_metrics and ar_metrics.get("per_song_preds"):
+            ds_corr = _per_dataset_corr(
+                ar_metrics["per_song_preds"],
+                ar_metrics["per_song_targets"],
+                ar_metrics["per_song_sources"],
+            )
+        else:
+            ds_corr = _per_dataset_corr(per_song_preds, per_song_targets, per_song_sources)
+        if ds_corr:
+            mode = "AR" if args.va_conditioning else "TF"
+            ds_parts = [
+                f"{src}: v={m['corr_valence']:.3f} a={m['corr_arousal']:.3f}"
+                for src, m in sorted(ds_corr.items())
+            ]
+            logging.info(f"Per-dataset valid corr ({mode}) — " + ", ".join(ds_parts))
+
         if args.va_conditioning and ar_metrics:
             logging.info(
                 f"Step {global_step} (epoch {epoch:.2f}) — Train Loss: {train_loss:.4f} | "
@@ -669,21 +912,32 @@ if __name__ == "__main__":
             wandb_payload["train/corr_arousal"] = train_metrics["corr_arousal"]
             wandb_payload["valid/corr_valence"] = valid_metrics["corr_valence"]
             wandb_payload["valid/corr_arousal"] = valid_metrics["corr_arousal"]
+        for src, m in ds_corr.items():
+            prefix = "valid/ar" if args.va_conditioning else "valid"
+            wandb_payload[f"{prefix}/{src}/corr_valence"] = m["corr_valence"]
+            wandb_payload[f"{prefix}/{src}/corr_arousal"] = m["corr_arousal"]
         wandb.log(wandb_payload, step=global_step)
 
-        checkpoint_mse = (
-            ar_metrics["mse"] if args.va_conditioning and ar_metrics else valid_metrics["mse"]
+        ckpt_val, lower_better = _checkpoint_value(
+            valid_metrics, ar_metrics, args.va_conditioning, args.checkpoint_metric,
         )
-        if checkpoint_mse < state["best_valid_mse"]:
-            state["best_valid_mse"] = checkpoint_mse
+        if state["best_metrics"] == {}:
+            improved = True
+        elif lower_better:
+            improved = ckpt_val < state["best_checkpoint_value"]
+        else:
+            improved = ckpt_val > state["best_checkpoint_value"]
+        if improved:
+            state["best_checkpoint_value"] = ckpt_val
+            state["best_checkpoint_lower"] = lower_better
             state["best_metrics"] = (
                 {**valid_metrics, **{f"ar_{k}": v for k, v in ar_metrics.items()}}
                 if ar_metrics else valid_metrics.copy()
             )
             torch.save(model.state_dict(),     best_model_path)
             torch.save(optimizer.state_dict(), best_optimizer_path)
-            label = "AR MSE" if args.va_conditioning else "MSE"
-            logging.info(f"Saved best model (valid {label}: {state['best_valid_mse']:.4f})")
+            metric_label = args.checkpoint_metric
+            logging.info(f"Saved best model (valid {metric_label}: {ckpt_val:.4f})")
             state["early_stopping_counter"] = 0
         else:
             state["early_stopping_counter"] += 1
@@ -722,9 +976,12 @@ if __name__ == "__main__":
                 differential_weight=args.differential_weight,
                 va_jitter_std=args.va_jitter_std,
                 va_label_dropout=args.va_label_dropout,
+                max_grad_norm=args.max_grad_norm,
+                n_bins=args.n_bins,
+                bin_sigma=bin_sigma,
             )
             n = metrics.get("n_labeled", int(batch["label_mask"].sum().item()))
-            if n > 0:
+            if n > 0 and np.isfinite(loss):
                 train_loss_accum += loss * n
                 for k in train_metrics_accum:
                     train_metrics_accum[k] += metrics[k] * n
@@ -736,6 +993,9 @@ if __name__ == "__main__":
         if state["done"]:
             break
 
-    logging.info(f"Training complete. Best valid MSE: {state['best_valid_mse']:.4f}")
+    logging.info(
+        f"Training complete. Best valid {args.checkpoint_metric}: "
+        f"{state['best_checkpoint_value']:.4f}"
+    )
     logging.info(f"Best metrics: {state['best_metrics']}")
     wandb.finish()

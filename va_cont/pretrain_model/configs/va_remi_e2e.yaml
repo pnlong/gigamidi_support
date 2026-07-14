@@ -1,0 +1,40 @@
+# Model A: end-to-end REMI bar encoder + scaled causal transformer (no MuseTok latents).
+# Bar t sees prior REMI embeddings only — previous V/A predictions are NOT used as input.
+# Preprocess first:
+#   python va_cont/preprocess/extract_bar_midi_features.py --dataset deam --feature_mode remi --resume
+#   python va_cont/preprocess/extract_bar_midi_features.py --dataset memo2496 --feature_mode remi --resume
+#   python va_cont/preprocess/extract_bar_midi_features.py --dataset merp --feature_mode remi --resume
+datasets: [deam, memo2496, merp]
+storage_dir: /deepfreeze/pnlong/gigamidi
+labels_path:  /deepfreeze/pnlong/gigamidi/deam_va/labels/deam_va_labels.json
+train_songs:  /deepfreeze/pnlong/gigamidi/deam_va/labels/train_songs.txt
+valid_songs:  /deepfreeze/pnlong/gigamidi/deam_va/labels/val_songs.txt
+feature_mode: remi
+latent_dim:  128
+va_conditioning: false
+d_model:     256
+n_heads:     8
+n_layers:    4
+d_ff:        512
+dropout:     0.1
+max_len:     512
+remi_max_tokens: 128
+remi_encoder_layers: 2
+remi_encoder_d_model: 128
+batch_size:               16
+learning_rate:            1e-4
+weight_decay:             1e-5
+max_grad_norm:            1.0
+epochs:                   10000
+valid_every_epochs:       1
+early_stopping:           false
+gpu:         true
+num_workers: 4
+target_mode:          absolute
+differential_weight:  0.0
+va_jitter_std:        0.0
+va_label_dropout:     0.0
+checkpoint_metric:    corr_sum
+output_dir:    /deepfreeze/pnlong/gigamidi/deam_va/checkpoints/trained_models
+model_name:    va_remi_e2e
+wandb_project: gigamidi-support

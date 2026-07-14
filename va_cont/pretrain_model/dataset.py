@@ -1,9 +1,10 @@
 """Sequence datasets for bar-level continuous valence/arousal regression.
 
-Loads MuseTok latents and derives bar-level V/A from tick-indexed continuous .npz
-(canonical) or falls back to cached bar-label JSON.
+Loads bar features (MuseTok latents, handcrafted MIDI stats, or REMI tokens) and
+derives bar-level V/A from tick-indexed continuous .npz or cached bar-label JSON.
 """
 
+import json
 import os
 import sys
 import logging
@@ -12,26 +13,49 @@ from typing import List, Optional
 
 import numpy as np
 import torch
+from safetensors import safe_open
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
 from utils.data_utils import load_latents, load_json
-from va_utils import bar_labels_from_latent_metadata, load_continuous_va, aggregate_va_to_bars
+from va_utils import bar_labels_from_latent_metadata
+from pretrain_model.midi_features import features_dir_for_dataset, HANDCRAFTED_FEATURE_DIM
+
+
+def _decode_metadata(raw: Optional[dict]) -> Optional[dict]:
+    if not raw:
+        return None
+    meta = {}
+    for key, value in raw.items():
+        try:
+            meta[key] = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            try:
+                meta[key] = int(value) if "." not in str(value) else float(value)
+            except ValueError:
+                meta[key] = value
+    return meta
+
+
+def load_remi_bar_features(filepath: str) -> tuple[np.ndarray, np.ndarray, Optional[dict]]:
+    """Load cached REMI bar tokens from safetensors."""
+    with safe_open(filepath, framework="pt", device="cpu") as f:
+        tokens = f.get_tensor("bar_tokens").numpy()
+        mask = f.get_tensor("token_padding_mask").numpy()
+        metadata = _decode_metadata(f.metadata())
+    return tokens, mask, metadata
 
 
 class VASequenceDataset(Dataset):
     """
     Song-level sequence dataset for continuous VA regression.
 
-    Each sample:
-      latents    (T, 128)
-      va_targets (T, 2)
-      label_mask (T,) bool
-
-    Bar labels are derived from continuous/{id}.npz when continuous_dir is set,
-    otherwise loaded from labels_path JSON cache.
+    feature_mode:
+      musetok     — (T, 128) MuseTok latents from latents_musetok/
+      handcrafted — (T, 32) per-bar MIDI statistics from features_handcrafted/
+      remi        — (T, L) REMI token ids + token_padding_mask from features_remi/
     """
 
     DATASET_NAME = "VA"
@@ -42,9 +66,13 @@ class VASequenceDataset(Dataset):
         song_list: List[str],
         labels_path: Optional[str] = None,
         continuous_dir: Optional[str] = None,
+        feature_mode: str = "musetok",
+        dataset_source: str = "unknown",
     ):
         self.latents_dir = latents_dir
         self.continuous_dir = continuous_dir
+        self.feature_mode = feature_mode
+        self.dataset_source = dataset_source
         json_labels = load_json(labels_path) if labels_path and os.path.isfile(labels_path) else {}
 
         self._songs: List[str] = []
@@ -60,13 +88,23 @@ class VASequenceDataset(Dataset):
                 latent_id = song_id
                 bar_entries = json_labels.get(song_id)
 
-            latent_path = os.path.join(latents_dir, f"{latent_id}.safetensors")
-            if not os.path.isfile(latent_path):
+            feat_path = os.path.join(latents_dir, f"{latent_id}.safetensors")
+            if not os.path.isfile(feat_path):
                 missing += 1
                 continue
 
-            latents, meta = load_latents(latent_path)
-            n_bars = len(latents)
+            bar_tokens = None
+            token_mask = None
+            meta = None
+
+            if feature_mode == "remi":
+                bar_tokens, token_mask, meta = load_remi_bar_features(feat_path)
+                n_bars = len(bar_tokens)
+                # Placeholder latents for shape compatibility in collate
+                latents = bar_tokens.astype(np.float32)
+            else:
+                latents, meta = load_latents(feat_path)
+                n_bars = len(latents)
 
             if bar_entries is None and self.continuous_dir:
                 cont_path = Path(self.continuous_dir) / f"{latent_id}.npz"
@@ -92,12 +130,21 @@ class VASequenceDataset(Dataset):
                 continue
 
             self._songs.append(song_id)
-            self._data.append((latents.astype(np.float32), va_targets, label_mask))
+            if feature_mode == "remi":
+                self._data.append((
+                    latents, va_targets, label_mask,
+                    bar_tokens.astype(np.int32), token_mask.astype(bool),
+                ))
+            else:
+                self._data.append((latents.astype(np.float32), va_targets, label_mask))
 
         if missing:
-            logging.warning(f"{self.DATASET_NAME}SequenceDataset: {missing} songs had no latent file")
+            logging.warning(
+                f"{self.DATASET_NAME}SequenceDataset ({feature_mode}): "
+                f"{missing} songs had no feature file in {latents_dir}"
+            )
         logging.info(
-            f"{self.DATASET_NAME}SequenceDataset: {len(self._songs)} songs loaded "
+            f"{self.DATASET_NAME}SequenceDataset ({feature_mode}): {len(self._songs)} songs loaded "
             f"({sum(d[2].sum() for d in self._data)} annotated bars total)"
         )
 
@@ -105,9 +152,21 @@ class VASequenceDataset(Dataset):
         return len(self._songs)
 
     def __getitem__(self, idx: int) -> dict:
+        if self.feature_mode == "remi":
+            latents, va_targets, label_mask, bar_tokens, token_mask = self._data[idx]
+            return {
+                "song_id": self._songs[idx],
+                "dataset_source": self.dataset_source,
+                "latents": torch.from_numpy(latents),
+                "bar_tokens": torch.from_numpy(bar_tokens),
+                "token_padding_mask": torch.from_numpy(token_mask),
+                "va_targets": torch.from_numpy(va_targets),
+                "label_mask": torch.from_numpy(label_mask),
+            }
         latents, va_targets, label_mask = self._data[idx]
         return {
             "song_id": self._songs[idx],
+            "dataset_source": self.dataset_source,
             "latents": torch.from_numpy(latents),
             "va_targets": torch.from_numpy(va_targets),
             "label_mask": torch.from_numpy(label_mask),
@@ -117,6 +176,7 @@ class VASequenceDataset(Dataset):
     def collate_fn(batch: List[dict]) -> dict:
         max_len = max(item["latents"].shape[0] for item in batch)
         B = len(batch)
+        has_remi = "bar_tokens" in batch[0]
         latent_dim = batch[0]["latents"].shape[1]
 
         latents = torch.zeros(B, max_len, latent_dim)
@@ -124,20 +184,37 @@ class VASequenceDataset(Dataset):
         label_mask = torch.zeros(B, max_len, dtype=torch.bool)
         padding_mask = torch.ones(B, max_len, dtype=torch.bool)
 
+        out = {
+            "song_id": [item["song_id"] for item in batch],
+            "dataset_source": [item.get("dataset_source", "unknown") for item in batch],
+            "latents": latents,
+            "va_targets": va_targets,
+            "label_mask": label_mask,
+            "padding_mask": padding_mask,
+        }
+
+        if has_remi:
+            max_tok = batch[0]["bar_tokens"].shape[1]
+            bar_tokens = torch.zeros(B, max_len, max_tok, dtype=torch.long)
+            token_padding_mask = torch.ones(B, max_len, max_tok, dtype=torch.bool)
+            out["bar_tokens"] = bar_tokens
+            out["token_padding_mask"] = token_padding_mask
+
         for i, item in enumerate(batch):
             T = item["latents"].shape[0]
             latents[i, :T] = item["latents"]
             va_targets[i, :T] = item["va_targets"]
             label_mask[i, :T] = item["label_mask"]
             padding_mask[i, :T] = False
+            if has_remi:
+                out["bar_tokens"][i, :T] = item["bar_tokens"]
+                out["token_padding_mask"][i, :T] = item["token_padding_mask"]
 
-        return {
-            "song_id": [item["song_id"] for item in batch],
-            "latents": latents,
-            "va_targets": va_targets,
-            "label_mask": label_mask,
-            "padding_mask": padding_mask,
-        }
+        out["latents"] = latents
+        out["va_targets"] = va_targets
+        out["label_mask"] = label_mask
+        out["padding_mask"] = padding_mask
+        return out
 
 
 class DEAMSequenceDataset(VASequenceDataset):
@@ -188,10 +265,17 @@ class CombinedVASequenceDataset(Dataset):
         return VASequenceDataset.collate_fn(batch)
 
 
+def _features_dir_for_adapter(ds, feature_mode: str) -> Path:
+    if feature_mode == "musetok":
+        return ds.latents_dir()
+    return features_dir_for_dataset(ds.storage_dir, ds.name, feature_mode)
+
+
 def build_dataset_for_source(
     name: str,
     split: str,
     storage_dir: Optional[str] = None,
+    feature_mode: str = "musetok",
 ) -> Optional[VASequenceDataset]:
     """
     Build a VASequenceDataset for a named source and split ('train' or 'valid').
@@ -203,9 +287,10 @@ def build_dataset_for_source(
 
     ds = get_dataset(name, storage_dir)
     split_path = ds.train_songs_path() if split == "train" else ds.valid_songs_path()
+    feat_dir = _features_dir_for_adapter(ds, feature_mode)
 
     if not (
-        ds.latents_dir().is_dir()
+        feat_dir.is_dir()
         and split_path.is_file()
         and (ds.continuous_dir().is_dir() or ds.bar_labels_cache_path().is_file())
     ):
@@ -224,8 +309,10 @@ def build_dataset_for_source(
     cls = cls_map.get(name, VASequenceDataset)
 
     return cls(
-        latents_dir=str(ds.latents_dir()),
+        latents_dir=str(feat_dir),
         song_list=song_list,
         labels_path=labels_path,
         continuous_dir=continuous_dir,
+        feature_mode=feature_mode,
+        dataset_source=name,
     )

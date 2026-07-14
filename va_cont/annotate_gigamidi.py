@@ -1,7 +1,11 @@
 """
 Annotate GigaMIDI with bar-level continuous valence/arousal predictions.
 
-Loads a trained CausalVATransformer and runs inference on each GigaMIDI song.
+Loads a trained VAModel and runs inference on each GigaMIDI song.
+
+  feature_mode musetok:     MuseTok latents (default, same as va_transformer_a/b/c)
+  feature_mode handcrafted: per-bar MIDI statistics (va_midi_handcrafted)
+  feature_mode remi:        REMI token encoder end-to-end (va_remi_e2e)
 
   Model A (--va_conditioning not set):
       Single forward pass — all bars in one shot with causal mask.
@@ -28,7 +32,13 @@ from datasets import load_dataset
 sys.path.insert(0, dirname(realpath(__file__)))
 
 from utils.musetok_utils import load_musetok_model, extract_latents_from_midi
-from pretrain_model.model import CausalVATransformer
+from pretrain_model.model import VAModel
+from pretrain_model.midi_features import (
+    extract_handcrafted_from_midi,
+    extract_remi_tokens_from_midi,
+    load_remi_vocab,
+    remi_vocab_size,
+)
 from utils.data_utils import ensure_dir, MUSETOK_CHECKPOINT_DIR
 
 
@@ -54,7 +64,13 @@ def parse_args():
     parser.add_argument("--dropout",     type=float, default=0.0,
                         help="Dropout at inference — set to 0 (default)")
     parser.add_argument("--max_len",     type=int,   default=512)
-    # MuseTok
+    parser.add_argument("--feature_mode", type=str, default="musetok",
+                        choices=["musetok", "handcrafted", "remi"])
+    parser.add_argument("--remi_vocab_size", type=int, default=None)
+    parser.add_argument("--remi_max_tokens", type=int, default=128)
+    parser.add_argument("--remi_encoder_layers", type=int, default=2)
+    parser.add_argument("--remi_encoder_d_model", type=int, default=128)
+    # MuseTok (only for feature_mode=musetok)
     parser.add_argument("--checkpoint_path", type=str, default=None)
     parser.add_argument("--vocab_path",      type=str, default=None)
     parser.add_argument("--velocity",        action="store_true")
@@ -63,9 +79,11 @@ def parse_args():
     parser.add_argument("--max_bars",    type=int, default=None,
                         help="Truncate songs to this many bars (useful for Model B speed)")
     parser.add_argument("--target_mode", type=str, default="absolute",
-                        choices=["absolute", "differential"],
-                        help="'absolute': model outputs absolute V/A (default). "
-                             "'differential': model outputs ΔV/ΔA; integrated via cumsum.")
+                        choices=["absolute", "differential", "binned"],
+                        help="'absolute' or 'binned': absolute V/A output. "
+                             "'differential': ΔV/ΔA integrated via cumsum.")
+    parser.add_argument("--n_bins", type=int, default=None,
+                        help="Bins for binned checkpoints (inferred from weights if omitted).")
     # Dataset
     parser.add_argument("--split",       type=str, default="train")
     parser.add_argument("--streaming",   action="store_true", default=True)
@@ -98,11 +116,31 @@ def load_processed_md5s(csv_path: str) -> set:
     return processed
 
 
+def _encode_song_features(sample, feature_mode, musetok_model, vocab, remi_vocab, remi_max_tokens):
+    """Return (latents, bar_tokens, token_mask) numpy arrays for one MIDI sample."""
+    midi_data = sample["music"]
+    if feature_mode == "musetok":
+        latents, _ = extract_latents_from_midi(
+            midi_data, musetok_model, vocab, has_velocity=True
+        )
+        return latents, None, None
+    if feature_mode == "handcrafted":
+        feats, _ = extract_handcrafted_from_midi(midi_data)
+        return feats, None, None
+    tokens, mask, _ = extract_remi_tokens_from_midi(
+        midi_data, remi_vocab, max_tokens=remi_max_tokens
+    )
+    return tokens.astype(np.float32), tokens, mask
+
+
 def process_song_model_a(
     sample: dict,
-    model: CausalVATransformer,
+    model: VAModel,
     musetok_model,
     vocab: dict,
+    remi_vocab: dict,
+    feature_mode: str,
+    remi_max_tokens: int,
     device: torch.device,
     max_bars: int = None,
     differential: bool = False,
@@ -112,16 +150,24 @@ def process_song_model_a(
     if not md5:
         return None
     try:
-        latents, _ = extract_latents_from_midi(
-            sample["music"], musetok_model, vocab, has_velocity=True
+        latents, bar_tokens, token_mask = _encode_song_features(
+            sample, feature_mode, musetok_model, vocab, remi_vocab, remi_max_tokens,
         )
         if len(latents) == 0:
             return None
         if max_bars:
             latents = latents[:max_bars]
-        lat_t = torch.from_numpy(latents.astype(np.float32)).unsqueeze(0).to(device)  # (1, T, 128)
+            if bar_tokens is not None:
+                bar_tokens = bar_tokens[:max_bars]
+                token_mask = token_mask[:max_bars]
+        lat_t = torch.from_numpy(latents.astype(np.float32)).unsqueeze(0).to(device)
+        fwd_kw = {}
+        if bar_tokens is not None:
+            fwd_kw["bar_tokens"] = torch.from_numpy(bar_tokens.astype(np.int64)).unsqueeze(0).to(device)
+            fwd_kw["token_padding_mask"] = torch.from_numpy(token_mask).unsqueeze(0).to(device)
         with torch.no_grad():
-            preds = model(lat_t).squeeze(0).cpu().numpy()  # (T, 2)
+            raw = model(lat_t, **fwd_kw)
+            preds = model.decode_va(raw).squeeze(0).cpu().numpy()
         if differential:
             preds = np.cumsum(preds, axis=0)
             preds = np.clip(preds, -1.0, 1.0)
@@ -136,9 +182,12 @@ def process_song_model_a(
 
 def process_song_model_b(
     sample: dict,
-    model: CausalVATransformer,
+    model: VAModel,
     musetok_model,
     vocab: dict,
+    remi_vocab: dict,
+    feature_mode: str,
+    remi_max_tokens: int,
     device: torch.device,
     max_bars: int = None,
     differential: bool = False,
@@ -148,16 +197,26 @@ def process_song_model_b(
     if not md5:
         return None
     try:
-        latents, _ = extract_latents_from_midi(
-            sample["music"], musetok_model, vocab, has_velocity=True
+        latents, bar_tokens, token_mask = _encode_song_features(
+            sample, feature_mode, musetok_model, vocab, remi_vocab, remi_max_tokens,
         )
         if len(latents) == 0:
             return None
         if max_bars:
             latents = latents[:max_bars]
-        lat_t = torch.from_numpy(latents.astype(np.float32)).unsqueeze(0).to(device)  # (1, T, 128)
+            if bar_tokens is not None:
+                bar_tokens = bar_tokens[:max_bars]
+                token_mask = token_mask[:max_bars]
+        lat_t = torch.from_numpy(latents.astype(np.float32)).unsqueeze(0).to(device)
         with torch.no_grad():
-            preds = model.infer_sequential(lat_t, differential=differential).cpu().numpy()  # (T, 2)
+            if bar_tokens is not None:
+                bt = torch.from_numpy(bar_tokens.astype(np.int64)).unsqueeze(0).to(device)
+                tm = torch.from_numpy(token_mask).unsqueeze(0).to(device)
+                preds = model.infer_sequential(
+                    bar_tokens=bt, token_padding_mask=tm, differential=differential,
+                ).cpu().numpy()
+            else:
+                preds = model.infer_sequential(latents=lat_t, differential=differential).cpu().numpy()
         if differential:
             preds = np.cumsum(preds, axis=0)
             preds = np.clip(preds, -1.0, 1.0)
@@ -177,8 +236,25 @@ if __name__ == "__main__":
     logging.info(f"Using device: {device}")
     logging.info(f"Model variant: {'B (sequential AR)' if args.va_conditioning else 'A (single pass)'}")
 
+    logging.info(f"Feature mode: {args.feature_mode}")
+
+    if args.feature_mode == "remi" and args.remi_vocab_size is None:
+        args.remi_vocab_size = remi_vocab_size(load_remi_vocab())
+
     logging.info(f"Loading model from {args.model_path}...")
-    model = CausalVATransformer(
+    state = torch.load(args.model_path, map_location="cpu")
+    head_key = "transformer.output_head.weight"
+    out_features = int(state[head_key].shape[0]) if head_key in state else 2
+    if out_features > 2:
+        output_mode = "binned"
+        n_bins = args.n_bins or (out_features // 2)
+        logging.info(f"Binned checkpoint detected: n_bins={n_bins}")
+    else:
+        output_mode = "regression"
+        n_bins = 20
+
+    model = VAModel(
+        feature_mode=args.feature_mode,
         latent_dim=args.latent_dim,
         d_model=args.d_model,
         n_heads=args.n_heads,
@@ -187,19 +263,30 @@ if __name__ == "__main__":
         dropout=args.dropout,
         max_len=args.max_len,
         va_conditioning=args.va_conditioning,
+        remi_vocab_size=args.remi_vocab_size or 0,
+        remi_max_tokens=args.remi_max_tokens,
+        remi_encoder_layers=args.remi_encoder_layers,
+        remi_encoder_d_model=args.remi_encoder_d_model,
+        output_mode=output_mode,
+        n_bins=n_bins,
     ).to(device)
-    model.load_state_dict(torch.load(args.model_path, map_location=device))
+    model.load_state_dict(state)
     model.eval()
     logging.info("Model loaded.")
 
-    logging.info("Loading MuseTok model...")
-    musetok_model, vocab, _ = load_musetok_model(
-        checkpoint_path=args.checkpoint_path,
-        vocab_path=args.vocab_path,
-        use_gpu=args.gpu,
-        prefer_velocity=args.velocity,
-    )
-    logging.info("MuseTok loaded.")
+    musetok_model, vocab, remi_vocab = None, None, None
+    if args.feature_mode == "musetok":
+        logging.info("Loading MuseTok model...")
+        musetok_model, vocab, _ = load_musetok_model(
+            checkpoint_path=args.checkpoint_path,
+            vocab_path=args.vocab_path,
+            use_gpu=args.gpu,
+            prefer_velocity=args.velocity,
+        )
+        logging.info("MuseTok loaded.")
+    elif args.feature_mode == "remi":
+        remi_vocab = load_remi_vocab()
+        logging.info("REMI vocabulary loaded.")
 
     ensure_dir(os.path.dirname(args.output_path))
     processed = set()
@@ -235,7 +322,8 @@ if __name__ == "__main__":
                 skipped += 1
                 continue
             rows = process_fn(
-                sample, model, musetok_model, vocab, device, args.max_bars,
+                sample, model, musetok_model, vocab, remi_vocab,
+                args.feature_mode, args.remi_max_tokens, device, args.max_bars,
                 differential=(args.target_mode == "differential"),
             )
             if rows:

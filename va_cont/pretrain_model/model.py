@@ -11,6 +11,8 @@ import math
 import torch
 import torch.nn as nn
 
+from pretrain_model.va_bins import decode_binned_logits, make_bin_centers
+
 
 class CausalVATransformer(nn.Module):
     """
@@ -37,10 +39,14 @@ class CausalVATransformer(nn.Module):
         dropout: float = 0.1,
         max_len: int = 512,
         va_conditioning: bool = False,
+        output_mode: str = "regression",
+        n_bins: int = 20,
     ):
         super().__init__()
         self.va_conditioning = va_conditioning
         self.d_model = d_model
+        self.output_mode = output_mode
+        self.n_bins = n_bins
         input_dim = latent_dim + (2 if va_conditioning else 0)
 
         # Learnable null VA token — used for bar 0 and unannotated predecessors (Model B).
@@ -64,8 +70,12 @@ class CausalVATransformer(nn.Module):
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
 
-        # Per-position regression head
-        self.output_head = nn.Linear(d_model, 2)
+        out_dim = 2 * n_bins if output_mode == "binned" else 2
+        self.output_head = nn.Linear(d_model, out_dim)
+        if output_mode == "binned":
+            self.register_buffer("bin_centers", make_bin_centers(n_bins))
+        else:
+            self.bin_centers = None
 
         self._init_weights()
 
@@ -97,8 +107,8 @@ class CausalVATransformer(nn.Module):
     # ------------------------------------------------------------------ #
 
     def _make_causal_mask(self, T: int, device: torch.device) -> torch.Tensor:
-        """Upper-triangular additive -inf mask so position i attends only to 0..i."""
-        return torch.triu(torch.full((T, T), float("-inf"), device=device), diagonal=1)
+        """Upper-triangular bool mask (True = masked); matches bool padding masks."""
+        return torch.triu(torch.ones(T, T, device=device, dtype=torch.bool), diagonal=1)
 
     def _build_prev_va(
         self, va_targets: torch.Tensor, label_mask: torch.BoolTensor
@@ -169,14 +179,18 @@ class CausalVATransformer(nn.Module):
         x = self.input_proj(x) + self.pos_enc[:T].unsqueeze(0)    # (B, T, d_model)
 
         causal_mask = self._make_causal_mask(T, x.device)
-        x = self.transformer(
-            x,
-            mask=causal_mask,
-            src_key_padding_mask=padding_mask,
-            is_causal=True,
-        )
+        enc_kw: dict = {"mask": causal_mask}
+        if padding_mask is not None:
+            enc_kw["src_key_padding_mask"] = padding_mask.to(device=x.device, dtype=torch.bool)
+        x = self.transformer(x, **enc_kw)
 
-        return self.output_head(x)  # (B, T, 2)
+        return self.output_head(x)
+
+    def decode_va(self, raw: torch.Tensor) -> torch.Tensor:
+        """Map model output to continuous (valence, arousal). Shape (..., 2)."""
+        if self.output_mode == "regression":
+            return raw
+        return decode_binned_logits(raw, self.bin_centers, self.n_bins)
 
     # ------------------------------------------------------------------ #
     #  Sequential AR inference (Model B only)                             #
@@ -225,9 +239,10 @@ class CausalVATransformer(nn.Module):
             x = self.input_proj(x) + self.pos_enc[: t + 1].unsqueeze(0)
 
             causal_mask = self._make_causal_mask(t + 1, x.device)
-            out = self.transformer(x, mask=causal_mask, is_causal=True)  # (1, t+1, d_model)
+            out = self.transformer(x, mask=causal_mask)  # (1, t+1, d_model)
 
-            pred_t = self.output_head(out[0, t, :])  # (2,) — raw prediction for bar t
+            raw_t = self.output_head(out[0, t, :])
+            pred_t = self.decode_va(raw_t)  # (2,) continuous VA for bar t
             predictions.append(pred_t)
 
             # Update integrated absolute VA for next bar's prev_va
@@ -238,3 +253,187 @@ class CausalVATransformer(nn.Module):
             running_abs.append(new_abs.detach())
 
         return torch.stack(predictions, dim=0)  # (T, 2)
+
+
+class REMIBarEncoder(nn.Module):
+    """
+    Encode padded REMI token sequences within each bar into a fixed-size embedding.
+
+    Input:
+        bar_tokens: (B, T, L) int — 0 = pad
+        token_padding_mask: (B, T, L) bool — True = padded token position
+    Output:
+        (B, T, output_dim)
+    """
+
+    def __init__(
+        self,
+        vocab_size: int,
+        output_dim: int = 128,
+        d_model: int = 128,
+        n_heads: int = 4,
+        n_layers: int = 2,
+        d_ff: int = 256,
+        max_tokens: int = 128,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.output_dim = output_dim
+        self.max_tokens = max_tokens
+        self.token_emb = nn.Embedding(vocab_size, d_model, padding_idx=0)
+        self.pos_emb = nn.Embedding(max_tokens, d_model)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=d_ff,
+            dropout=dropout,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.proj = nn.Linear(d_model, output_dim)
+        # Bars with no REMI tokens (empty bar or batch padding) use this embedding.
+        self.null_bar = nn.Parameter(torch.zeros(output_dim))
+
+    def forward(
+        self,
+        bar_tokens: torch.Tensor,
+        token_padding_mask: torch.BoolTensor,
+    ) -> torch.Tensor:
+        B, T, L = bar_tokens.shape
+        bar_tokens = bar_tokens.long().clamp(0, self.token_emb.num_embeddings - 1)
+        pos = torch.arange(L, device=bar_tokens.device).unsqueeze(0).expand(B * T, L)
+        flat_tokens = bar_tokens.reshape(B * T, L)
+        flat_mask = token_padding_mask.reshape(B * T, L).to(dtype=torch.bool)
+        has_tokens = (~flat_mask).any(dim=1)
+
+        pooled = torch.zeros(B * T, self.proj.in_features, device=bar_tokens.device, dtype=self.proj.weight.dtype)
+
+        if has_tokens.any():
+            idx = has_tokens.nonzero(as_tuple=True)[0]
+            x = self.token_emb(flat_tokens[idx]) + self.pos_emb(pos[idx])
+            enc_mask = flat_mask[idx]
+            x = self.encoder(x, src_key_padding_mask=enc_mask)
+            valid = (~enc_mask).float().unsqueeze(-1)
+            denom = valid.sum(dim=1).clamp(min=1.0)
+            pooled[idx] = (x * valid).sum(dim=1) / denom
+
+        out = self.proj(pooled)
+        if (~has_tokens).any():
+            out[~has_tokens] = self.null_bar
+        return out.reshape(B, T, self.output_dim)
+
+
+class VAModel(nn.Module):
+    """
+    Unified VA regression model supporting multiple bar input modes.
+
+    feature_mode:
+      musetok / handcrafted — latents (B, T, D) fed directly to CausalVATransformer
+      remi — bar_tokens encoded by REMIBarEncoder, then CausalVATransformer
+    """
+
+    def __init__(
+        self,
+        feature_mode: str = "musetok",
+        latent_dim: int = 128,
+        d_model: int = 128,
+        n_heads: int = 4,
+        n_layers: int = 2,
+        d_ff: int = 256,
+        dropout: float = 0.1,
+        max_len: int = 512,
+        va_conditioning: bool = False,
+        remi_vocab_size: int = 0,
+        remi_max_tokens: int = 128,
+        remi_encoder_layers: int = 2,
+        remi_encoder_d_model: int = 128,
+        output_mode: str = "regression",
+        n_bins: int = 20,
+    ):
+        super().__init__()
+        self.feature_mode = feature_mode
+        self.va_conditioning = va_conditioning
+        self.output_mode = output_mode
+        self.n_bins = n_bins
+
+        bar_encoder = None
+        transformer_input_dim = latent_dim
+        if feature_mode == "remi":
+            if remi_vocab_size <= 0:
+                raise ValueError("remi_vocab_size required for feature_mode=remi")
+            bar_encoder = REMIBarEncoder(
+                vocab_size=remi_vocab_size,
+                output_dim=latent_dim,
+                d_model=remi_encoder_d_model,
+                n_heads=n_heads,
+                n_layers=remi_encoder_layers,
+                d_ff=d_ff,
+                max_tokens=remi_max_tokens,
+                dropout=dropout,
+            )
+        self.bar_encoder = bar_encoder
+
+        self.transformer = CausalVATransformer(
+            latent_dim=transformer_input_dim,
+            d_model=d_model,
+            n_heads=n_heads,
+            n_layers=n_layers,
+            d_ff=d_ff,
+            dropout=dropout,
+            max_len=max_len,
+            va_conditioning=va_conditioning,
+            output_mode=output_mode,
+            n_bins=n_bins,
+        )
+
+    def decode_va(self, raw: torch.Tensor) -> torch.Tensor:
+        return self.transformer.decode_va(raw)
+
+    def _encode_bars(
+        self,
+        latents: torch.Tensor = None,
+        bar_tokens: torch.Tensor = None,
+        token_padding_mask: torch.BoolTensor = None,
+    ) -> torch.Tensor:
+        if self.feature_mode == "remi":
+            assert bar_tokens is not None and token_padding_mask is not None
+            return self.bar_encoder(bar_tokens, token_padding_mask)
+        assert latents is not None
+        return latents
+
+    def forward(
+        self,
+        latents: torch.Tensor = None,
+        padding_mask: torch.BoolTensor = None,
+        va_targets: torch.Tensor = None,
+        label_mask: torch.BoolTensor = None,
+        bar_tokens: torch.Tensor = None,
+        token_padding_mask: torch.BoolTensor = None,
+    ) -> torch.Tensor:
+        x = self._encode_bars(latents, bar_tokens, token_padding_mask)
+        return self.transformer(
+            x,
+            padding_mask=padding_mask,
+            va_targets=va_targets,
+            label_mask=label_mask,
+        )
+
+    @torch.no_grad()
+    def infer_sequential(
+        self,
+        latents: torch.Tensor = None,
+        differential: bool = False,
+        bar_tokens: torch.Tensor = None,
+        token_padding_mask: torch.BoolTensor = None,
+    ) -> torch.Tensor:
+        assert self.va_conditioning, "infer_sequential is only for Model B"
+        if latents is not None:
+            x = self._encode_bars(latents=latents)
+            assert x.shape[0] == 1
+            return self.transformer.infer_sequential(x, differential=differential)
+        assert bar_tokens is not None
+        x = self._encode_bars(bar_tokens=bar_tokens, token_padding_mask=token_padding_mask)
+        assert x.shape[0] == 1
+        return self.transformer.infer_sequential(x, differential=differential)
+
